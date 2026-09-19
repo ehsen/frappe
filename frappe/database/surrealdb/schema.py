@@ -143,6 +143,7 @@ class ColumnSpec:
 	unique: bool = False
 	index: bool = False
 	custom_assert: str | None = None
+	order: int | None = None  # position in the table definition (SELECT * returns columns in this order)
 	kind: str = field(init=False)
 	arg: tuple = field(init=False)
 
@@ -234,6 +235,8 @@ class ColumnSpec:
 
 	def meta(self) -> dict:
 		m = {"t": self.logical, "n": 1 if self.nullable else 0}
+		if self.order is not None:
+			m["o"] = self.order
 		if (d := self.display_default()) is not None:
 			m["d"] = d
 		return m
@@ -334,12 +337,13 @@ def create_statements(
 	"""All statements to create a DocType table (ADR 0001 layout)."""
 	stmts = [f"DEFINE TABLE {quote_table(table)} SCHEMAFULL"]
 	nm = name_spec(autoname)
+	nm.order = 0
 	stmts.append(nm.define_field(table))
 	stmts += nm.define_shadows(table)
 	base = [ColumnSpec(n, t, nul, d) for n, t, nul, d in DEFAULT_COLUMNS]
-	if is_child:
-		base += [ColumnSpec(n, t) for n, t in CHILD_COLUMNS]
-	for spec in [*base, *columns]:
+	child = [ColumnSpec(n, t) for n, t in CHILD_COLUMNS] if is_child else []
+	for position, spec in enumerate([*base, *columns, *child], start=1):
+		spec.order = position
 		stmts.append(spec.define_field(table))
 		stmts += spec.define_shadows(table)
 
@@ -454,6 +458,9 @@ class SurrealDBTable(DBTable):
 			spec = specs.get(col.fieldname)
 			if spec is None:
 				continue
+			spec.order = 1 + max(
+				(c.get("o", 0) for c in frappe.db.table_info(table).columns.values()), default=0
+			)
 			ddl(spec.define_field(table))
 			for stmt in spec.define_shadows(table):
 				ddl(stmt)
@@ -611,12 +618,15 @@ def encode_for_kind(spec: ColumnSpec, value):
 
 
 def decode_for_kind(spec: ColumnSpec, value):
+	return decode_kind(spec.kind, value)
+
+
+def decode_kind(k: str, value):
 	"""Stored value -> what MariaDB's driver returns to Frappe (dates/datetimes as objects, decimals as float)."""
 	import datetime as dt
 
 	if value is None:
 		return None
-	k = spec.kind
 	if k == "date":
 		if value == "0000-00-00":
 			return None
@@ -755,3 +765,53 @@ def parse_table_info(info: dict) -> TableInfo:
 			ix["name"] = logical_name(ix["name"])
 			indexes[logical_name(unquote(key))] = ix
 	return TableInfo(columns, indexes)
+
+
+# --- table schema for the translator ---------------------------------------------------------------------------------
+@dataclass
+class TableSchema:
+	name: str
+	columns: dict  # logical column name -> ColumnSpec, in definition order
+	indexes: dict
+
+	def column(self, name: str) -> ColumnSpec | None:
+		return self.columns.get(name)
+
+	@property
+	def name_kind(self) -> str:
+		return self.columns["name"].kind if "name" in self.columns else "varchar"
+
+
+def table_schema_from_info(table_name: str, info: dict) -> TableSchema:
+	parsed = parse_table_info(info)
+	ordered = sorted(parsed.columns.items(), key=lambda kv: (kv[1].get("o", 10**6), kv[0]))
+	columns = {}
+	for order, (name, meta) in enumerate(ordered):
+		columns[name] = ColumnSpec(name, meta["t"], nullable=bool(meta["n"]), order=order)
+	return TableSchema(table_name, columns, parsed.indexes)
+
+
+def table_schema(table_name: str, db=None) -> TableSchema:
+	"""Schema of a table from `INFO FOR TABLE`, cached per request/process (cleared by every DDL statement)."""
+	cache = _schema_cache()
+	if (cached := cache.get(table_name)) is not None:
+		return cached
+	db = db or frappe.db
+	schema = table_schema_from_info(table_name, db._info(f"INFO FOR TABLE {quote_table(table_name)}"))
+	if not schema.columns:
+		# INFO FOR TABLE on a missing table returns an empty structure instead of an error (measured, P1.4)
+		raise SurrealDBProgrammingError(1146, f"Table '{table_name}' doesn't exist")
+	cache[table_name] = schema
+	return schema
+
+
+def _schema_cache() -> dict:
+	try:
+		return frappe.local.surrealdb_schemas
+	except AttributeError:
+		frappe.local.surrealdb_schemas = cache = {}
+		return cache
+
+
+def clear_schema_cache():
+	_schema_cache().clear()

@@ -61,7 +61,7 @@ class TestSurrealDBDispatch(UnitTestCase):
 		self.assertIs(get_query_builder("surrealdb"), SurrealDB)
 		self.assertIs(db_type_is("surrealdb"), db_type_is.SURREALDB)
 		with self.assertRaises(SurrealDBNotImplementedError):
-			SurrealDB.from_("ToDo").select("name").get_sql()
+			SurrealDB.from_("ToDo").select("name").for_update().get_sql()
 
 	def test_query_functions_without_a_surrealdb_mapping_fail_closed(self):
 		from frappe.query_builder.functions import GroupConcat

@@ -96,6 +96,30 @@ MEASURED = [
 		E.ER_ACCESS_DENIED,
 		"Access denied",
 	),
+	(
+		"Database record `tabParityZz:`pz-1`` already exists",
+		E.SurrealDBIntegrityError,
+		E.ER_DUP_ENTRY,
+		"Duplicate entry 'pz-1' for key 'PRIMARY'",
+	),
+	(
+		"Couldn't coerce value for field `qty` of `tabParityZz:`qq-1``: Expected `int` but found `NULL`",
+		E.SurrealDBIntegrityError,
+		E.ER_BAD_NULL_ERROR,
+		"Column 'qty' cannot be null",
+	),
+	(
+		"Found 'xxx' for field `title`, with record `tabParityZz:`qq-2``, but field must conform to: $value = NULL OR (string::len($value) <= 140)",
+		E.SurrealDBDataError,
+		E.ER_DATA_TOO_LONG,
+		"Data too long for column 'title' at row 1",
+	),
+	(
+		"Database index `title` already contains 'k', with record `tabParityZz:`pz-3``",
+		E.SurrealDBIntegrityError,
+		E.ER_DUP_ENTRY,
+		"Duplicate entry 'k' for key 'title'",
+	),
 ]
 
 

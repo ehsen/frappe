@@ -44,6 +44,7 @@ READ_ONLY_STARTS = ("select", "info", "return", "show")
 WRITE_STARTS = ("create", "insert", "update", "upsert", "delete", "relate", "define", "remove", "alter")
 _FIRST_WORD = re.compile(r"^\s*(\w+)")
 # `/*cols:a,b,c*/` anywhere in the query text: the projection order emitted by the translator (see SurrealCursor)
+_KINDS_HINT = re.compile(r"/\*\s*kinds:\s*([\w,]*)\s*\*/")
 _COLUMNS_HINT = re.compile(r"/\*\s*cols:\s*(\w+(?:\s*,\s*\w+)*)\s*\*/")
 _TEMPORAL = (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)
 
@@ -361,6 +362,8 @@ class SurrealCursor:
 
 		hint = _COLUMNS_HINT.search(text)
 		columns = [c.strip() for c in hint[1].split(",")] if hint else None
+		kinds_hint = _KINDS_HINT.search(text)
+		kinds = kinds_hint[1].split(",") if kinds_hint else None
 		results = self.connection.execute(text, values)
 		last = results[-1] if results else None
 		if last_statement_word(text) in WRITE_STARTS:
@@ -368,6 +371,8 @@ class SurrealCursor:
 			self.rowcount = len(last) if isinstance(last, list) else 0
 		else:
 			self._shape(last, columns)
+			if kinds:
+				self._decode(kinds)
 		return None
 
 	def _shape(self, result, hint=None):
@@ -396,6 +401,18 @@ class SurrealCursor:
 		self.description = tuple((name, None, None, None, None, None, None) for name in columns)
 		self._rows = tuple(table)
 		self.rowcount = len(table)
+
+	def _decode(self, kinds: list[str]):
+		"""Stored date/datetime/time values -> the objects MariaDB's driver returns (the `/*kinds:...*/` hint names each column)."""
+		from frappe.database.surrealdb.schema import decode_kind
+
+		convert = [i for i, k in enumerate(kinds) if k in ("date", "datetime", "time")]
+		if not convert:
+			return
+		self._rows = tuple(
+			tuple(decode_kind(kinds[i], v) if i in convert else v for i, v in enumerate(row))
+			for row in self._rows
+		)
 
 	def fetchall(self):
 		rows, self._pos = self._rows[self._pos :], len(self._rows)

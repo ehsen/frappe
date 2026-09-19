@@ -152,7 +152,7 @@ def _coercion_error(field: str, expected: str, value: str) -> SurrealDBError:
 _STATEMENT_PATTERNS = [
 	(
 		re.compile(
-			r"Database index `(?P<index>[^`]+)` already contains (?P<value>.+?), with record `(?P<record>[^`]+)`",
+			r"Database index `(?P<index>[^`]+)` already contains (?P<value>.+?), with record `(?P<record>.+)`\s*$",
 			re.S,
 		),
 		lambda m: SurrealDBIntegrityError(
@@ -160,21 +160,21 @@ _STATEMENT_PATTERNS = [
 		),
 	),
 	(
-		re.compile(r"Database record `(?P<record>[^`]+)` already exists"),
+		re.compile(r"Database record `(?P<record>.+?)` already exists"),
 		lambda m: SurrealDBIntegrityError(
 			ER_DUP_ENTRY, f"Duplicate entry '{_record_key(m['record'])}' for key 'PRIMARY'"
 		),
 	),
 	(
 		re.compile(
-			r"Found (?P<value>.*) for field `(?P<field>[^`]+)`, with record `[^`]+`, but field must conform to: (?P<cond>.*)",
+			r"Found (?P<value>.*) for field `(?P<field>[^`]+)`, with record `.+?`, but field must conform to: (?P<cond>.*)",
 			re.S,
 		),
 		lambda m: _assertion_error(m["field"], m["value"], m["cond"]),
 	),
 	(
 		re.compile(
-			r"Couldn't coerce value for field `(?P<field>[^`]+)` of `[^`]+`: Expected `(?P<expected>[^`]+)` but found (?P<value>.*)",
+			r"Couldn't coerce value for field `(?P<field>[^`]+)` of `.+?`: Expected `(?P<expected>[^`]+)` but found (?P<value>.*)",
 			re.S,
 		),
 		lambda m: _coercion_error(m["field"], m["expected"], m["value"]),

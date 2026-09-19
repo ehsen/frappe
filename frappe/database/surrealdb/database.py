@@ -34,6 +34,7 @@ from frappe.database.surrealdb.schema import (
 	SurrealDBTable,
 	TableInfo,
 	base_field,
+	clear_schema_cache,
 	convert_column,
 	index_statement,
 	parse_table_info,
@@ -232,6 +233,7 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		# `create` is a row insert here; only DEFINE/REMOVE change the table list
 		if query_type in ("define", "remove"):
 			frappe.client_cache.delete_value("db_tables")
+			clear_schema_cache()
 
 	def set_execution_timeout(self, seconds: int):
 		# Rendered as a `TIMEOUT` clause by the query translator (P1.6); SurrealDB has no session-level setting and
