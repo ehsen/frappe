@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 import frappe
-from frappe.database import get_command, get_db, setup_database
+from frappe.database import bootstrap_database, get_command, get_db
 from frappe.database.surrealdb.database import SurrealDBDatabase
 from frappe.database.surrealdb.errors import SurrealDBNotImplementedError
 from frappe.query_builder.surrealdb_builder import SurrealDB
@@ -35,14 +35,12 @@ class TestSurrealDBDispatch(UnitTestCase):
 		with _conf("surrealdb"):
 			db = get_db(cur_db_name="scratch")
 			for call in (
-				lambda: db.connect(),
-				lambda: db.sql("select 1"),
-				lambda: db.sql_ddl("create table x"),
 				lambda: db.get_tables(),
 				lambda: db.has_index("tabToDo", "x"),
+				lambda: db.add_index("ToDo", ["name"]),
 				lambda: db.type_map.get("Data", ("varchar",)),
 				lambda: db.type_map["Data"],
-				lambda: setup_database(force=False),
+				lambda: bootstrap_database(),
 				lambda: get_command(),
 			):
 				with self.assertRaises(SurrealDBNotImplementedError):
@@ -50,8 +48,8 @@ class TestSurrealDBDispatch(UnitTestCase):
 
 	def test_error_names_the_owning_chunk_and_is_not_implemented_error(self):
 		with _conf("surrealdb"), self.assertRaises(NotImplementedError) as cm:
-			get_db(cur_db_name="scratch").sql("select 1")
-		self.assertIn("P1.3", str(cm.exception))
+			get_db(cur_db_name="scratch").get_tables()
+		self.assertIn("P1.4", str(cm.exception))
 		self.assertIn("does not fall back", str(cm.exception))
 
 	def test_unclassified_errors_are_not_mistaken_for_mariadb_errors(self):

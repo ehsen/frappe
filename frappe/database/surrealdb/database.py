@@ -1,28 +1,53 @@
+import frappe
 from frappe.database.database import Database
-from frappe.database.surrealdb.errors import unsupported
+from frappe.database.surrealdb.connection import (
+	DEFAULT_NAMESPACE,
+	ConnectionParams,
+	SurrealConnection,
+)
+from frappe.database.surrealdb.errors import (
+	ER_ACCESS_DENIED,
+	ER_BAD_FIELD,
+	ER_CANT_DROP_FIELD_OR_KEY,
+	ER_DATA_TOO_LONG,
+	ER_DUP_ENTRY,
+	ER_DUP_FIELDNAME,
+	ER_LOCK_WAIT_TIMEOUT,
+	ER_NO_SUCH_TABLE,
+	ER_PARSE_ERROR,
+	ER_STATEMENT_TIMEOUT,
+	SurrealDBConnectionError,
+	SurrealDBDataError,
+	SurrealDBError,
+	SurrealDBOperationalError,
+	SurrealDBProgrammingError,
+	SurrealDBTransactionConflict,
+	unsupported,
+)
+
+
+def _code(e) -> int | None:
+	return e.code if isinstance(e, SurrealDBError) else None
 
 
 class SurrealDBExceptionUtil:
-	"""`is_*` predicates used by `Database` to classify driver errors (implemented in P1.3).
+	"""`is_*` predicates used by `Database` to classify driver errors. They answer from the classified error
+	types/codes of `errors.py`; an error that was not classified is never mistaken for a known class."""
 
-	They return False for now: an unclassified error propagates unchanged, it is never mistaken for a
-	MariaDB error class.
-	"""
-
-	ProgrammingError = Exception
-	TableMissingError = Exception
-	OperationalError = Exception
-	InternalError = Exception
-	SQLError = Exception
-	DataError = Exception
+	ProgrammingError = SurrealDBProgrammingError
+	TableMissingError = SurrealDBProgrammingError
+	OperationalError = SurrealDBOperationalError
+	InternalError = SurrealDBError
+	SQLError = SurrealDBError
+	DataError = SurrealDBDataError
 
 	@staticmethod
 	def is_deadlocked(e) -> bool:
-		return False
+		return isinstance(e, SurrealDBTransactionConflict)
 
 	@staticmethod
 	def is_timedout(e) -> bool:
-		return False
+		return _code(e) == ER_LOCK_WAIT_TIMEOUT
 
 	@staticmethod
 	def is_read_only_mode_error(e) -> bool:
@@ -30,39 +55,39 @@ class SurrealDBExceptionUtil:
 
 	@staticmethod
 	def is_table_missing(e) -> bool:
-		return False
+		return _code(e) == ER_NO_SUCH_TABLE
 
 	@staticmethod
 	def is_missing_column(e) -> bool:
-		return False
+		return _code(e) == ER_BAD_FIELD
 
 	@staticmethod
 	def is_duplicate_fieldname(e) -> bool:
-		return False
+		return _code(e) == ER_DUP_FIELDNAME
 
 	@staticmethod
 	def is_duplicate_entry(e) -> bool:
-		return False
+		return _code(e) == ER_DUP_ENTRY
 
 	@staticmethod
 	def is_access_denied(e) -> bool:
-		return False
+		return _code(e) == ER_ACCESS_DENIED
 
 	@staticmethod
 	def cant_drop_field_or_key(e) -> bool:
-		return False
+		return _code(e) == ER_CANT_DROP_FIELD_OR_KEY
 
 	@staticmethod
 	def is_syntax_error(e) -> bool:
-		return False
+		return _code(e) == ER_PARSE_ERROR
 
 	@staticmethod
 	def is_statement_timeout(e) -> bool:
-		return False
+		return _code(e) == ER_STATEMENT_TIMEOUT
 
 	@staticmethod
 	def is_data_too_long(e) -> bool:
-		return False
+		return _code(e) == ER_DATA_TOO_LONG
 
 	@staticmethod
 	def is_db_table_size_limit(e) -> bool:
@@ -70,15 +95,15 @@ class SurrealDBExceptionUtil:
 
 	@staticmethod
 	def is_primary_key_violation(e) -> bool:
-		return False
+		return _code(e) == ER_DUP_ENTRY and "for key 'PRIMARY'" in str(e.message)
 
 	@staticmethod
 	def is_unique_key_violation(e) -> bool:
-		return False
+		return _code(e) == ER_DUP_ENTRY and "for key 'PRIMARY'" not in str(e.message)
 
 	@staticmethod
 	def is_interface_error(e) -> bool:
-		return False
+		return isinstance(e, SurrealDBConnectionError)
 
 	@staticmethod
 	def is_nested_transaction_error(e) -> bool:
@@ -101,6 +126,15 @@ class _UnmappedTypeMap(dict):
 		unsupported("the fieldtype -> SurrealDB type map", "P1.4")
 
 
+def get_namespace() -> str:
+	return frappe.conf.get("db_namespace") or DEFAULT_NAMESPACE
+
+
+def get_url(host, port) -> str:
+	scheme = "wss" if frappe.conf.get("db_ssl") else "ws"
+	return f"{scheme}://{host or '127.0.0.1'}:{port or SurrealDBDatabase.default_port}"
+
+
 class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 	default_port = 8000
 	MAX_ROW_SIZE_LIMIT = None
@@ -109,17 +143,31 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		self.db_type = "surrealdb"
 		self.type_map = _UnmappedTypeMap()
 
-	def get_connection(self):
-		unsupported("the WebSocket connection", "P1.3")
+	def get_connection(self) -> SurrealConnection:
+		"""Open an authenticated session as the site's database-level user (see setup_db.setup_database)."""
+		params = ConnectionParams(
+			url=get_url(self.host, self.port),
+			namespace=get_namespace(),
+			database=self.cur_db_name,
+			username=self.user,
+			password=self.password,
+			level="database",
+		)
+		return SurrealConnection(params).open()
+
+	def sql(self, *args, as_dict=0, **kwargs):
+		# pluck / as_list / plain tuples read columns by position; only as_dict reads by name
+		self._require_order = not as_dict
+		return super().sql(*args, as_dict=as_dict, **kwargs)
+
+	def execute_query(self, query, values=None):
+		self._cursor.require_order = getattr(self, "_require_order", True)
+		return super().execute_query(query, values)
 
 	def set_execution_timeout(self, seconds: int):
-		unsupported("statement execution timeout", "P1.3")
-
-	def sql(self, *args, **kwargs):
-		unsupported("running queries (driver boundary)", "P1.3")
-
-	def sql_ddl(self, *args, **kwargs):
-		unsupported("running DDL", "P1.4")
+		# Rendered as a `TIMEOUT` clause by the query translator (P1.6); SurrealDB has no session-level setting and
+		# `--transaction-timeout` is not enforced on interactive transactions (P0.4).
+		self._conn.statement_timeout = seconds
 
 	@staticmethod
 	def escape(s, percent=True):
