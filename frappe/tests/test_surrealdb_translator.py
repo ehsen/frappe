@@ -4,7 +4,7 @@ import datetime as dt
 import unittest
 from decimal import Decimal
 
-from pypika import Table
+from pypika import Order, Table
 from pypika import functions as fn
 
 import frappe
@@ -41,6 +41,7 @@ def make_schema():
 		col("Time", "at"),
 		col("Long Text", "notes"),
 		col("Check", "flag"),
+		col("Data", "note"),
 	]
 	return S.TableSchema("tabDoc", {s.name: s for s in specs}, {})
 
@@ -79,7 +80,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertTrue(
 			sql.startswith("SELECT `name`, `creation`, `title`, `select@f` AS `select`, `qty`,"), sql
 		)
-		self.assertIn("/*cols:name,creation,title,select,qty,amount,day,stamp,at,notes,flag*/", sql)
+		self.assertIn("/*cols:name,creation,title,select,qty,amount,day,stamp,at,notes,flag,note*/", sql)
 
 	def test_alias_and_offset(self):
 		sql, _ = r(q().select(T.title.as_("t")).limit(10).offset(20))
@@ -195,10 +196,14 @@ class TestSurrealDBTranslator(UnitTestCase):
 		other = Table("tabOther")
 		cases = {
 			"join": q().join(other).on(T.name == other.name).select(T.name),
-			"group by": q().select(T.title).groupby(T.title),
-			"distinct": q().select(T.title).distinct(),
-			"aggregate": q().select(fn.Count("*")),
 			"function": q().select(fn.Upper(T.title)),
+			"avg": q().select(fn.Avg(T.qty)),
+			"sum of varchar": q().select(fn.Sum(T.title)),
+			"min of varchar": q().select(fn.Min(T.title)),
+			"non-grouped column": q().select(T.title, fn.Count("*")),
+			"having against a column": q().select(fn.Count("*")).having(fn.Count("*") > T.qty),
+			"group by long text": q().select(T.notes, fn.Count("*")).groupby(T.notes),
+			"order by non-grouped": q().select(T.flag, fn.Count("*")).groupby(T.flag).orderby(T.title),
 			"subquery in": q().select(T.name).where(T.name.isin(SurrealDB.from_(other).select(other.name))),
 			"long text compare": q().select(T.name).where(T.notes == "x"),
 			"string vs number": q().select(T.name).where(T.title == 5),
@@ -215,6 +220,40 @@ class TestSurrealDBTranslator(UnitTestCase):
 		for label, query in cases.items():
 			with self.subTest(label), self.assertRaises(SurrealDBNotImplementedError):
 				r(query)
+
+	def test_aggregates_group_by_distinct_having(self):
+		sql, _ = r(q().select(fn.Count("*").as_("n")))
+		self.assertEqual(
+			sql,
+			"SELECT `__a0` AS `n` FROM (SELECT count() AS `__a0` FROM `tabDoc` GROUP ALL) /*cols:n*/ /*kinds:int*/",
+		)
+		sql, _ = r(q().select(fn.Sum(T.qty), fn.Count(T.note), fn.Max(T.day)).where(T.flag == 1))
+		self.assertIn("math::sum(`qty`) AS `__a0`, count(`qty` != NULL AND `qty` != NONE) AS `__n0`", sql)
+		self.assertIn("count(`note` != NULL AND `note` != NONE) AS `__a1`", sql)
+		self.assertIn(
+			"IF `__n0` = 0 THEN NULL ELSE `__a0` END AS `sum_0`", sql
+		)  # SUM of nothing is NULL in MariaDB
+		self.assertIn("WHERE (`flag` = $param1) GROUP ALL", sql)
+		self.assertTrue(sql.endswith("/*cols:sum_0,count_1,max_2*/ /*kinds:int,int,date*/"), sql)
+		# varchar keys group by the collation shadow and show one member of the group
+		sql, _ = r(q().select(T.title, fn.Count("*").as_("n")).groupby(T.title).orderby(T.title))
+		self.assertIn("`title@ci` AS `__k0`, array::group(`title`) AS `__v0`", sql)
+		self.assertIn("GROUP BY `title@ci`", sql)
+		self.assertIn("array::first(`__v0`) AS `title`", sql)
+		self.assertIn("ORDER BY `__o0` ASC", sql)
+		sql, params = r(
+			q()
+			.select(T.flag, fn.Count("*").as_("n"))
+			.groupby(T.flag)
+			.having(fn.Count("*") > 3)
+			.orderby(fn.Count("*"), order=Order.desc)
+			.limit(2)
+		)
+		self.assertIn("WHERE (`__a0` != NULL AND `__a0` != NONE AND `__a0` > $param1)", sql)
+		self.assertIn("ORDER BY `__o0` DESC LIMIT 2", sql)
+		self.assertEqual(params.values["param1"], 3)
+		sql, _ = r(q().select(T.flag, T.qty).distinct())
+		self.assertIn("GROUP BY `flag`, `qty`", sql)
 
 	def test_values_are_never_interpolated(self):
 		evil = "x'; REMOVE TABLE tabDoc; --"

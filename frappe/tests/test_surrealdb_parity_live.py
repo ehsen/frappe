@@ -12,6 +12,7 @@ from pypika import Table
 import frappe
 from frappe.database.schema import DbColumn
 from frappe.database.surrealdb import schema as S
+from frappe.database.surrealdb.collation import ci_key as collation_key
 from frappe.database.surrealdb.errors import SurrealDBError
 from frappe.database.surrealdb.translator import render
 from frappe.query_builder.builder import MariaDB
@@ -470,6 +471,142 @@ class TestSurrealDBParityLive(LiveSurrealDB, UnitTestCase):
 				failures,
 			)
 		self.assertEqual(failures, [], f"{len(failures)} write steps disagree:\n" + "\n".join(failures[:20]))
+
+	def test_aggregate_parity(self):
+		from pypika import Order
+		from pypika import functions as fn
+
+		failures = []
+		none = [
+			None,
+			lambda: T.title == "no such value",
+			lambda: T.qty > 5,
+			lambda: T.note.isnull(),
+			lambda: (T.flag == 1) & (T.qty < 0),
+		]
+		for w in none:
+			label = "all" if w is None else "filtered"
+
+			def scalar(select, w=w):
+				return lambda Q: (lambda q: q if w is None else q.where(w()))(Q.from_(T).select(*select))
+
+			for name, select in {
+				"count(*)": [fn.Count("*")],
+				"count cols": [
+					fn.Count(T.title),
+					fn.Count(T.note),
+					fn.Count(T.amount),
+					fn.Count(T.posting_date),
+				],
+				"sum": [fn.Sum(T.qty), fn.Sum(T.amount), fn.Sum(T.flag)],
+				"min/max numbers": [fn.Min(T.qty), fn.Max(T.qty), fn.Min(T.amount), fn.Max(T.amount)],
+				"min/max temporal": [
+					fn.Min(T.posting_date),
+					fn.Max(T.posting_date),
+					fn.Min(T.stamp),
+					fn.Max(T.stamp),
+					fn.Min(T.at),
+					fn.Max(T.at),
+				],
+			}.items():
+				self.both(f"{name} ({label})", scalar(select), failures)
+
+		# GROUP BY. Group values on varchar keys are compared by collation key: MariaDB shows one (arbitrary) member of the group
+		def by_key(rows):
+			return sorted(
+				(tuple(collation_key(v) if isinstance(v, str) else v for v in row) for row in rows), key=repr
+			)
+
+		groups = {
+			"group by flag": lambda Q: Q.from_(T)
+			.select(T.flag, fn.Count("*"))
+			.groupby(T.flag)
+			.orderby(T.flag),
+			"group by flag sum/min/max": lambda Q: Q.from_(T)
+			.select(T.flag, fn.Sum(T.qty), fn.Min(T.amount), fn.Max(T.stamp))
+			.groupby(T.flag)
+			.orderby(T.flag),
+			"group by date (NULL key)": lambda Q: Q.from_(T)
+			.select(T.posting_date, fn.Count("*"), fn.Sum(T.amount))
+			.groupby(T.posting_date)
+			.orderby(T.posting_date),
+			"group by qty": lambda Q: Q.from_(T)
+			.select(T.qty, fn.Count(T.note))
+			.groupby(T.qty)
+			.orderby(T.qty),
+			"group by two": lambda Q: Q.from_(T)
+			.select(T.flag, T.qty, fn.Count("*"))
+			.groupby(T.flag, T.qty)
+			.orderby(T.flag)
+			.orderby(T.qty),
+			"group by where": lambda Q: Q.from_(T)
+			.select(T.flag, fn.Count("*"))
+			.where(T.qty > 3)
+			.groupby(T.flag)
+			.orderby(T.flag),
+			"having count": lambda Q: Q.from_(T)
+			.select(T.qty, fn.Count("*"))
+			.groupby(T.qty)
+			.having(fn.Count("*") > 8)
+			.orderby(T.qty),
+			"having sum": lambda Q: Q.from_(T)
+			.select(T.flag, fn.Sum(T.qty))
+			.groupby(T.flag)
+			.having(fn.Sum(T.qty) >= 100)
+			.orderby(T.flag),
+			"having not": lambda Q: Q.from_(T)
+			.select(T.qty, fn.Count("*"))
+			.groupby(T.qty)
+			.having(~(fn.Count("*") > 8))
+			.orderby(T.qty),
+			"order by aggregate": lambda Q: Q.from_(T)
+			.select(T.qty, fn.Count("*"))
+			.groupby(T.qty)
+			.orderby(fn.Count("*"), order=Order.desc)
+			.orderby(T.qty),
+			"group limit offset": lambda Q: Q.from_(T)
+			.select(T.qty, fn.Count("*"))
+			.groupby(T.qty)
+			.orderby(T.qty)
+			.limit(4)
+			.offset(3),
+			"distinct flag,qty": lambda Q: Q.from_(T)
+			.select(T.flag, T.qty)
+			.distinct()
+			.orderby(T.flag)
+			.orderby(T.qty),
+			"distinct posting_date": lambda Q: Q.from_(T)
+			.select(T.posting_date)
+			.distinct()
+			.orderby(T.posting_date),
+		}
+		for label, build in groups.items():
+			self.both(label, build, failures)
+
+		# collation-equal strings form one group; the shown value is one of the members
+		for label, build in {
+			"group by title": lambda Q: Q.from_(T)
+			.select(T.title, fn.Count("*"), fn.Sum(T.qty))
+			.groupby(T.title),
+			"distinct title": lambda Q: Q.from_(T).select(T.title).distinct(),
+			"group by note,flag": lambda Q: Q.from_(T)
+			.select(T.note, T.flag, fn.Count("*"))
+			.groupby(T.note, T.flag),
+		}.items():
+			expected = by_key(self.run_maria(build))
+			try:
+				got = by_key(self.run_surreal(build))
+			except Exception as e:
+				self.sdb.rollback()
+				failures.append(
+					f"{label}: SurrealDB raised {type(e).__name__}: {str(getattr(e, 'raw', e))[:200]}"
+				)
+				continue
+			if expected != got:
+				failures.append(f"{label}: {len(expected)} vs {len(got)} groups; {describe(expected, got)}")
+		self.assertEqual(
+			failures, [], f"{len(failures)} aggregate cases disagree:\n" + "\n".join(failures[:20])
+		)
 
 	def test_constraint_error_parity(self):
 		"""The same statements must fail on both engines with the same MariaDB error number."""

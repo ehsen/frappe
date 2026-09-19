@@ -44,6 +44,7 @@ NEGATED = {"=": "!=", "!=": "=", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
 FLIPPED = {"=": "=", "!=": "!=", ">": "<", ">=": "<=", "<": ">", "<=": ">="}
 INT_KINDS = ("int", "tinyint", "smallint", "bigint")
 NUMERIC_KINDS = frozenset((*INT_KINDS, "decimal"))
+AGGREGATES = ("Count", "Sum", "Min", "Max")
 
 
 def _attr(query, name, default=None):
@@ -319,12 +320,12 @@ class Renderer:
 
 	# --- SELECT ------------------------------------------------------------------------------------------------------
 	def select(self, q) -> str:
-		self._reject(
-			q, "_joins", "_union", "_for_update", "_distinct", "_havings", "_groupbys", "_with", "_prewheres"
-		)
+		self._reject(q, "_joins", "_union", "_for_update", "_with", "_prewheres")
 		if len(q._from) != 1:
 			unsupported("a SELECT without exactly one table", "P1.6")
 		schema = self._bind_table(q._from[0])
+		if q._groupbys or q._distinct or q._havings or any(_kind(term) in AGGREGATES for term in q._selects):
+			return self.grouped_select(q, schema)
 		projection, names, sources = self._projection(q._selects, schema)
 		parts = [f"SELECT {', '.join(projection)} FROM {quote_table(schema.name)}"]
 		if q._wheres is not None:
@@ -347,6 +348,171 @@ class Renderer:
 			parts.append(f"START {int(q._offset)}")
 		kinds = ",".join(schema.columns[n].kind for n in sources)
 		return " ".join(parts) + f" /*cols:{','.join(names)}*/ /*kinds:{kinds}*/"
+
+	# --- aggregates, GROUP BY, DISTINCT, HAVING ------------------------------------------------------------------------------
+	# Two levels, because SurrealDB cannot nest aggregates and returns non-grouped values as arrays (P0.3, measured):
+	#   SELECT <display> FROM (SELECT <keys>, <aggregates> FROM t WHERE .. GROUP BY <keys> | GROUP ALL) WHERE <having> ORDER BY ..
+	# * a varchar group key is the collation shadow (MariaDB groups collation-equal strings together); the value shown is one
+	#   member of the group (`array::first(array::group(col))`), as MariaDB shows one arbitrary member;
+	# * SUM / MIN / MAX of nothing (empty set, or all NULL) are 0 / +-Infinity in SurrealDB and NULL in MariaDB: each carries the
+	#   count of non-NULL inputs and the outer level turns "none" into NULL;
+	# * COUNT(col) counts non-NULL values (`count(col != NULL AND col != NONE)`), COUNT(*) is `count()`.
+	def grouped_select(self, q, schema: TableSchema) -> str:
+		group_terms = list(q._groupbys)
+		if q._distinct and not group_terms:
+			if not all(_kind(t) == "Field" for t in q._selects):
+				unsupported("DISTINCT over an expression", "P1.6")
+			group_terms = list(q._selects)
+		has_aggregate = any(_kind(t) in AGGREGATES for t in q._selects)
+		if not has_aggregate and not group_terms:
+			unsupported("HAVING without aggregates or GROUP BY", "P1.6")
+		inner, group_by, keys = [], [], {}
+		for i, term in enumerate(group_terms):
+			name, spec = self._column(term)
+			if spec.kind in ("text", "json"):
+				unsupported(f"GROUP BY a {spec.logical} column", "P1.6")
+			stored = physical(name)
+			if spec.is_varchar:
+				inner += [
+					f"{quote(stored + SHADOW_CI)} AS `__k{i}`",
+					f"array::group({quote(stored)}) AS `__v{i}`",
+				]
+				group_by.append(quote(stored + SHADOW_CI))
+				keys[name] = (f"array::first(`__v{i}`)", f"`__k{i}`", spec)
+			else:
+				inner.append(f"{quote(stored)} AS `__k{i}`")
+				group_by.append(quote(stored))
+				keys[name] = (f"`__k{i}`", f"`__k{i}`", spec)
+		aggregates: dict = {}
+
+		def aggregate(term):
+			"""Register an aggregate; returns (outer expression, result kind)."""
+			func = _kind(term)
+			if func not in AGGREGATES:
+				unsupported(f"the aggregate/function {func}", "P1.6")
+			arg = term.args[0] if term.args else None
+			if _kind(arg) == "Star" or arg is None:
+				column, spec = "*", None
+			else:
+				column, spec = self._column(arg)
+			key = (func, column)
+			if key in aggregates:
+				return aggregates[key]
+			j = len(aggregates)
+			if column == "*":
+				if func != "Count":
+					unsupported(f"{func}(*)", "P1.6")
+				inner.append(f"count() AS `__a{j}`")
+				result = (f"`__a{j}`", "int")
+			else:
+				stored = quote(physical(column))
+				present = f"{stored} != NULL AND {stored} != NONE"
+				if func == "Count":
+					inner.append(f"count({present}) AS `__a{j}`")
+					result = (f"`__a{j}`", "int")
+				else:
+					numeric = spec.kind in (*INT_KINDS, "decimal")
+					ordered = numeric or spec.kind in ("date", "datetime", "time")
+					if (func == "Sum" and not numeric) or (func in ("Min", "Max") and not ordered):
+						unsupported(f"{func.upper()} of a {spec.logical} column", "P1.6")
+					if spec.kind in ("date", "datetime"):
+						# stored as text: math::min/max would give +-Infinity. Collect the distinct values, drop NULLs, sort, take an end
+						inner.append(f"array::group({stored}) AS `__a{j}`")
+						pick = "first" if func == "Min" else "last"
+						result = (
+							f"array::{pick}(array::sort(array::complement(`__a{j}`, [NULL, NONE])))",
+							spec.kind,
+						)
+					else:
+						function = {"Sum": "math::sum", "Min": "math::min", "Max": "math::max"}[func]
+						inner.extend([f"{function}({stored}) AS `__a{j}`", f"count({present}) AS `__n{j}`"])
+						result = (f"IF `__n{j}` = 0 THEN NULL ELSE `__a{j}` END", spec.kind)
+			aggregates[key] = result
+			return result
+
+		outer, names, kinds = [], [], []
+		for term in q._selects:
+			kind = _kind(term)
+			if kind == "Field":
+				name, spec = self._column(term)
+				if name not in keys:
+					unsupported(
+						f"the non-grouped column {name!r} in an aggregate query (MariaDB's non-strict GROUP BY)",
+						"P1.6",
+					)
+				expr, out = keys[name][0], term.alias or name
+				kinds.append(spec.kind)
+			elif kind in AGGREGATES:
+				expr, result_kind = aggregate(term)
+				out = term.alias or f"{kind.lower()}_{len(names)}"
+				kinds.append(result_kind)
+			else:
+				unsupported(f"the select term {kind} in an aggregate query", "P1.6")
+			if not _NAME.match(out):
+				unsupported(f"the result column name {out!r}", "P1.6")
+			outer.append(f"{expr} AS {quote(out)}")
+			names.append(out)
+
+		outer_where = self._having(q._havings, aggregate) if q._havings is not None else None
+
+		ordering = []
+		for field, order in q._orderbys or []:
+			if _kind(field) == "Field":
+				name, spec = self._column(field)
+				if name not in keys:
+					unsupported("ORDER BY a non-grouped column in an aggregate query", "P1.6")
+				expr = keys[name][1]
+			elif _kind(field) in AGGREGATES:
+				expr = aggregate(field)[0]
+			else:
+				unsupported(f"ORDER BY {_kind(field)} in an aggregate query", "P1.6")
+			ordering.append((expr, "DESC" if order is not None and _sql_word(order) == "desc" else "ASC"))
+		hidden = [f"{expr} AS `__o{i}`" for i, (expr, _) in enumerate(ordering)]
+
+		inner_sql = f"SELECT {', '.join(inner)} FROM {quote_table(schema.name)}"
+		if q._wheres is not None:
+			inner_sql += f" WHERE {self.predicate(q._wheres)}"
+		inner_sql += f" GROUP BY {', '.join(group_by)}" if group_by else " GROUP ALL"
+		parts = [f"SELECT {', '.join(outer + hidden)} FROM ({inner_sql})"]
+		if outer_where:
+			parts.append(f"WHERE {outer_where}")
+		if ordering:
+			parts.append("ORDER BY " + ", ".join(f"`__o{i}` {d}" for i, (_, d) in enumerate(ordering)))
+		if q._limit is not None:
+			parts.append(f"LIMIT {int(q._limit)}")
+		if q._offset:
+			parts.append(f"START {int(q._offset)}")
+		return " ".join(parts) + f" /*cols:{','.join(names)}*/ /*kinds:{','.join(kinds)}*/"
+
+	def _having(self, term, aggregate, negate: bool = False) -> str:
+		"""HAVING: the same negation-pushing, NULL-guarded predicate compiler, over aggregate results and numeric constants."""
+		kind = _kind(term)
+		if kind == "ComplexCriterion":
+			op = _sql_word(term.comparator)
+			if op not in ("and", "or"):
+				unsupported(f"the boolean operator {op} in HAVING", "P1.6")
+			joiner = {"and": "or", "or": "and"}[op] if negate else op
+			return f"({self._having(term.left, aggregate, negate)} {joiner.upper()} {self._having(term.right, aggregate, negate)})"
+		if kind == "Not":
+			return self._having(term.term, aggregate, not negate)
+		if kind != "BasicCriterion":
+			unsupported(f"the HAVING predicate {kind}", "P1.6")
+		op = COMPARATORS.get(_sql_word(term.comparator))
+		if op is None:
+			unsupported("this HAVING comparator", "P1.6")
+		if negate:
+			op = NEGATED[op]
+		left, right = term.left, term.right
+		if _kind(right) in AGGREGATES and _kind(left) not in AGGREGATES:
+			left, right, op = right, left, FLIPPED[op]
+		if _kind(left) not in AGGREGATES:
+			unsupported("HAVING without an aggregate on one side", "P1.6")
+		is_literal, value = self._literal(right)
+		if not is_literal or not isinstance(value, bool | int | float | Decimal) or isinstance(value, bool):
+			unsupported("HAVING against anything but a number", "P1.6")
+		expr, _ = aggregate(left)
+		param = self.params.add(Decimal(str(value)) if isinstance(value, float) else value)
+		return f"({expr} != NULL AND {expr} != NONE AND {expr} {op} {param})"
 
 	def _projection(self, selects, schema: TableSchema):
 		projection, names, sources = [], [], []
