@@ -11,6 +11,7 @@ import frappe
 from frappe.query_builder.terms import NamedParameterWrapper
 
 from .builder import Base, MariaDB, Postgres, SQLite
+from .surrealdb_builder import SurrealDB
 
 
 class PseudoColumnMapper(PseudoColumn):
@@ -27,12 +28,14 @@ class db_type_is(Enum):
 	MARIADB = "mariadb"
 	POSTGRES = "postgres"
 	SQLITE = "sqlite"
+	SURREALDB = "surrealdb"
 
 
 DB_TYPE_MAP = {
 	db_type_is.MARIADB: MariaDB,
 	db_type_is.POSTGRES: Postgres,
 	db_type_is.SQLITE: SQLite,
+	db_type_is.SURREALDB: SurrealDB,
 }
 
 
@@ -42,6 +45,10 @@ class ImportMapper:
 
 	def __call__(self, *args: Any, **kwds: Any) -> Callable:
 		db = db_type_is(frappe.conf.db_type)
+		if db is db_type_is.SURREALDB and db not in self.func_map:
+			from frappe.database.surrealdb.errors import unsupported
+
+			unsupported("a query function without a SurrealDB mapping", "P1.6c")
 		return self.func_map[db](*args, **kwds)
 
 
@@ -50,7 +57,7 @@ class BuilderIdentificationFailed(Exception):
 		super().__init__("Couldn't guess builder")
 
 
-def get_query_builder(type_of_db: str) -> Postgres | MariaDB | SQLite:
+def get_query_builder(type_of_db: str) -> Postgres | MariaDB | SQLite | SurrealDB:
 	"""Return the query builder object.
 
 	Args:

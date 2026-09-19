@@ -68,6 +68,10 @@ def _get_site_config(sites_path: str, site_path: str) -> _dict[str, Any]:
 			from frappe.database.postgres.database import PostgresDatabase
 
 			return PostgresDatabase.default_port
+		elif db_type == "surrealdb":
+			from frappe.database.surrealdb.database import SurrealDBDatabase
+
+			return SurrealDBDatabase.default_port
 
 		raise ValueError(f"Unsupported db_type={db_type}")
 
@@ -75,7 +79,7 @@ def _get_site_config(sites_path: str, site_path: str) -> _dict[str, Any]:
 
 	config["db_type"] = os.environ.get("FRAPPE_DB_TYPE") or config.get("db_type") or "mariadb"
 
-	if config["db_type"] in ("mariadb", "postgres"):
+	if config["db_type"] in ("mariadb", "postgres", "surrealdb"):
 		config["db_socket"] = os.environ.get("FRAPPE_DB_SOCKET") or config.get("db_socket")
 		config["db_host"] = os.environ.get("FRAPPE_DB_HOST") or config.get("db_host") or "127.0.0.1"
 		config["db_port"] = int(

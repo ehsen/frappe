@@ -100,6 +100,10 @@ Documentation = "https://docs.frappe.io/framework"
 "Bug Reports" = "https://github.com/frappe/frappe/issues"
 
 [project.optional-dependencies]
+surrealdb = [
+    # SurrealDB backend (db_type=surrealdb); pinned to the SDK series measured in Phase 0
+    "surrealdb~=2.0.0",
+]
 dev = [
     "pyngrok~=7.5.0",
     "watchdog~=6.0.0",

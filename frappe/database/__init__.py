@@ -12,6 +12,11 @@ from frappe.database.database import savepoint
 def setup_database(force, verbose=None, mariadb_user_host_login_scope=None):
 	import frappe
 
+	if frappe.conf.db_type == "surrealdb":
+		import frappe.database.surrealdb.setup_db
+
+		return frappe.database.surrealdb.setup_db.setup_database(force, verbose)
+
 	if frappe.conf.db_type == "mariadb":
 		import frappe.database.mariadb.setup_db
 
@@ -29,6 +34,11 @@ def setup_database(force, verbose=None, mariadb_user_host_login_scope=None):
 def bootstrap_database(verbose=None, source_sql=None):
 	import frappe
 
+	if frappe.conf.db_type == "surrealdb":
+		import frappe.database.surrealdb.setup_db
+
+		return frappe.database.surrealdb.setup_db.bootstrap_database(verbose, source_sql)
+
 	if frappe.conf.db_type == "mariadb":
 		import frappe.database.mariadb.setup_db
 
@@ -45,6 +55,11 @@ def bootstrap_database(verbose=None, source_sql=None):
 
 def drop_user_and_database(db_name, db_user):
 	import frappe
+
+	if frappe.conf.db_type == "surrealdb":
+		import frappe.database.surrealdb.setup_db
+
+		return frappe.database.surrealdb.setup_db.drop_user_and_database(db_name, db_user)
 
 	if frappe.conf.db_type == "mariadb":
 		import frappe.database.mariadb.setup_db
@@ -64,6 +79,13 @@ def get_db(socket=None, host=None, user=None, password=None, port=None, cur_db_n
 	import frappe
 
 	conf = frappe.local.conf
+
+	if conf.db_type == "surrealdb":
+		import frappe.database.surrealdb.database
+
+		return frappe.database.surrealdb.database.SurrealDBDatabase(
+			socket, host, user, password, port, cur_db_name
+		)
 
 	if conf.db_type == "postgres":
 		import frappe.database.postgres.database
@@ -122,6 +144,11 @@ def get_command(
 	socket=None, host=None, port=None, user=None, password=None, db_name=None, extra=None, dump=False
 ):
 	import frappe
+
+	if frappe.conf.db_type == "surrealdb":
+		from frappe.database.surrealdb.errors import unsupported
+
+		unsupported("the database console/dump command", "P1.11")
 
 	if frappe.conf.db_type == "mariadb":
 		if dump:
