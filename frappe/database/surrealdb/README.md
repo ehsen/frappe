@@ -25,9 +25,11 @@ upstream project.
 | P1.1 scaffolding and explicit `db_type` dispatch | implemented; the full Frappe suite was compared with the MariaDB baseline and no regression is attributable to the change |
 | P1.2 site provisioning (namespace, database, scoped user; create/drop) | implemented and tested against a live server, including `bench new-site` / `drop-site` up to bootstrap |
 | P1.3 driver boundary (connection, cursor, error mapping, transactions, parameters) | implemented and tested (fake SDK and live server) |
-| Schema/DDL, query builder, ORM layer, locks and savepoints, raw-SQL rewrites, site install | not started |
+| P1.4 schema: fieldtype mapping, DDL, introspection, collation shadow keys, sequences | implemented; all 271 table-backed Frappe DocTypes apply to SurrealDB and match MariaDB's columns and indexes with no unexplained difference |
+| P1.6 query translator: single-table SELECT (exact NULL and collation semantics), aggregates, GROUP BY, INSERT/UPDATE/DELETE | implemented and compared with MariaDB on identical data (167 predicates, orderings, writes, 41 aggregate cases); joins, functions and subqueries fail closed and are next |
+| ORM layer, locks and savepoints, raw-SQL rewrites, site install | not started |
 
-A site cannot be installed on SurrealDB yet. Everything not implemented **fails closed**: it raises
+A site cannot be installed on SurrealDB yet (the framework bootstrap is still missing). Everything not implemented **fails closed**: it raises
 `SurrealDBNotImplementedError` naming the work item that owns it, and never falls through into MariaDB's or
 Postgres's code path.
 
@@ -36,9 +38,10 @@ Postgres's code path.
 All SurrealDB code is isolated so that merging upstream stays cheap:
 
 ```
-frappe/database/surrealdb/      the backend: database.py, connection.py (driver boundary), errors.py,
-                                setup_db.py (provisioning), schema.py (stub)
-frappe/query_builder/surrealdb_builder.py   query builder facade (fails closed until the translator lands)
+frappe/database/surrealdb/      the backend: database.py, connection.py (driver boundary), errors.py, setup_db.py (provisioning),
+                                schema.py (fieldtypes -> DDL, introspection), collation.py (utf8mb4_unicode_ci shadow keys),
+                                values.py (value encoders), translator.py (PyPika -> SurrealQL), data/ (frozen weight table)
+frappe/query_builder/surrealdb_builder.py   query builder facade over the translator
 frappe/tests/test_surrealdb_*.py            tests (dispatch, error classification, driver, live server)
 ```
 
@@ -52,7 +55,8 @@ Branches: `version-16` mirrors upstream, `surreal/v16` is the integration branch
 
 * **Parity, never approximation.** Unsupported constructs raise; a result that differs from MariaDB is a bug.
 * **Collation.** MariaDB's `utf8mb4_unicode_ci` (case, accent and PAD-space insensitive) is reproduced with an exact
-  weight-key emulation, because record ids and uniqueness depend on it.
+  weight-key emulation (`data/unicode_ci_weights.json`, extracted once from MariaDB 11.8.5 and frozen: the collation is UCA 4.0.0 and
+  never changes), because record ids, uniqueness, comparisons and ordering depend on it.
 * **Concurrency.** SurrealDB detects write conflicts at commit (optimistic) instead of blocking like MariaDB. The
   plan is unit-of-work retry plus application-level locks, mapped onto Frappe's existing `QueryDeadlockError`.
 * **Transactions.** WebSocket only, one interactive transaction per Frappe transaction. A statement that fails inside a
