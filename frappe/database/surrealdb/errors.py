@@ -30,6 +30,9 @@ ER_DATA_TOO_LONG = 1406
 ER_TRUNCATED_WRONG_VALUE = 1366
 ER_STATEMENT_TIMEOUT = 1969
 ER_CHECK_CONSTRAINT = 4025
+ER_BAD_NULL_ERROR = 1048
+ER_WARN_DATA_OUT_OF_RANGE = 1264
+ER_TRUNCATED_WRONG_DATE = 1292
 CR_SERVER_GONE = 2006
 
 
@@ -120,6 +123,31 @@ def _record_key(record: str) -> str:
 	return key.strip("`⟨⟩ ") or record
 
 
+def _assertion_error(field: str, value: str, cond: str) -> SurrealDBError:
+	"""Which MariaDB error a failed ASSERT corresponds to is decided by what the (generated) ASSERT checks."""
+	if "string::len(" in cond and "<=" in cond:
+		return SurrealDBDataError(ER_DATA_TOO_LONG, f"Data too long for column '{field}' at row 1")
+	if "string::matches(" in cond:
+		return SurrealDBDataError(
+			ER_TRUNCATED_WRONG_DATE,
+			f"Incorrect date/datetime value: '{_strip_quotes(value)}' for column '{field}' at row 1",
+		)
+	if "$value >=" in cond and "$value <=" in cond:
+		return SurrealDBDataError(
+			ER_WARN_DATA_OUT_OF_RANGE, f"Out of range value for column '{field}' at row 1"
+		)
+	return SurrealDBDataError(ER_CHECK_CONSTRAINT, f"CONSTRAINT `{field}` failed: {cond.strip()}")
+
+
+def _coercion_error(field: str, expected: str, value: str) -> SurrealDBError:
+	shown = _strip_quotes(value)
+	if shown in ("NULL", "NONE"):
+		return SurrealDBIntegrityError(ER_BAD_NULL_ERROR, f"Column '{field}' cannot be null")
+	return SurrealDBDataError(
+		ER_TRUNCATED_WRONG_VALUE, f"Incorrect {expected} value: '{shown}' for column '{field}' at row 1"
+	)
+
+
 # (pattern, factory) — patterns are the measured server messages; first match wins.
 _STATEMENT_PATTERNS = [
 	(
@@ -142,23 +170,14 @@ _STATEMENT_PATTERNS = [
 			r"Found (?P<value>.*) for field `(?P<field>[^`]+)`, with record `[^`]+`, but field must conform to: (?P<cond>.*)",
 			re.S,
 		),
-		lambda m: (
-			SurrealDBDataError(ER_DATA_TOO_LONG, f"Data too long for column '{m['field']}' at row 1")
-			if "string::len(" in m["cond"] and "<=" in m["cond"]
-			else SurrealDBDataError(
-				ER_CHECK_CONSTRAINT, f"CONSTRAINT `{m['field']}` failed: {m['cond'].strip()}"
-			)
-		),
+		lambda m: _assertion_error(m["field"], m["value"], m["cond"]),
 	),
 	(
 		re.compile(
 			r"Couldn't coerce value for field `(?P<field>[^`]+)` of `[^`]+`: Expected `(?P<expected>[^`]+)` but found (?P<value>.*)",
 			re.S,
 		),
-		lambda m: SurrealDBDataError(
-			ER_TRUNCATED_WRONG_VALUE,
-			f"Incorrect {m['expected']} value: '{_strip_quotes(m['value'])}' for column '{m['field']}' at row 1",
-		),
+		lambda m: _coercion_error(m["field"], m["expected"], m["value"]),
 	),
 	(
 		re.compile(r"Found field '(?P<field>[^']+)', but no such field exists for table '(?P<table>[^']+)'"),

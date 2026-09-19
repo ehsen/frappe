@@ -35,11 +35,9 @@ class TestSurrealDBDispatch(UnitTestCase):
 		with _conf("surrealdb"):
 			db = get_db(cur_db_name="scratch")
 			for call in (
-				lambda: db.get_tables(),
-				lambda: db.has_index("tabToDo", "x"),
-				lambda: db.add_index("ToDo", ["name"]),
-				lambda: db.type_map.get("Data", ("varchar",)),
-				lambda: db.type_map["Data"],
+				lambda: db.get_database_size(),
+				lambda: db.escape("x"),
+				lambda: db.get_on_duplicate_update(),
 				lambda: bootstrap_database(),
 				lambda: get_command(),
 			):
@@ -48,8 +46,8 @@ class TestSurrealDBDispatch(UnitTestCase):
 
 	def test_error_names_the_owning_chunk_and_is_not_implemented_error(self):
 		with _conf("surrealdb"), self.assertRaises(NotImplementedError) as cm:
-			get_db(cur_db_name="scratch").get_tables()
-		self.assertIn("P1.4", str(cm.exception))
+			get_db(cur_db_name="scratch").get_database_size()
+		self.assertIn("P4.5", str(cm.exception))
 		self.assertIn("does not fall back", str(cm.exception))
 
 	def test_unclassified_errors_are_not_mistaken_for_mariadb_errors(self):
