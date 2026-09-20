@@ -268,7 +268,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertIn("GROUP BY `__k1`, `__k2`", sql)
 
 	# --- P1.6c ----------------------------------------------------------------------------------------------------------
-	def test_equality_join_is_a_hash_join(self):
+	def test_join_step_is_a_closure_over_the_previous_rows(self):
 		other = Table("tabOther")
 		sql, _ = r(
 			q()
@@ -278,43 +278,50 @@ class TestSurrealDBTranslator(UnitTestCase):
 			.where((T.flag == 1) & (other.note == "x"))
 			.orderby(T.name)
 		)
-		# previous rows (the first table pre-filtered by its own WHERE conjunct), their keys, the next table read once for those
-		# keys and grouped into `key -> [record ids]`
-		self.assertIn("LET $jr1 = (SELECT VALUE { `t0`: $this } FROM `tabDoc` WHERE (`flag` = $param1))", sql)
+		# the first table pre-filtered by its own WHERE conjunct; one closure per join step; the closure parameter (not `$parent`,
+		# which SurrealDB scans) carries the earlier row so the join column's index is used
 		self.assertIn(
-			"LET $jk1 = array::complement(array::distinct((SELECT VALUE `t0`.`name@ci` FROM $jr1)), [NULL, NONE])",
+			"(array::flatten(array::map((SELECT VALUE { `t0`: $this } FROM `tabDoc` WHERE (`flag` = $param1)), |$r| {",
 			sql,
 		)
-		self.assertIn(
-			"LET $jc1 = (SELECT `title@ci` AS `k`, id AS `ids` FROM `tabOther` WHERE `title@ci` IN $jk1 GROUP BY `k`)",
-			sql,
-		)
-		self.assertIn("LET $jm1 = object::from_entries((SELECT VALUE [`k`, `ids`] FROM $jc1))", sql)
-		# each row fetches its candidates by record id, and the whole ON criterion is applied to them
-		self.assertIn(
-			"FROM (IF $parent.`t0`.`name@ci` = NULL OR $parent.`t0`.`name@ci` = NONE THEN [] ELSE ($jm1[$parent.`t0`.`name@ci`] ?? []) END) WHERE",
-			sql,
-		)
-		self.assertIn("IF array::len($m) = 0 { [{ `t0`: $this.`t0`, `t1`: NONE }] } ELSE { $m }", sql)
+		self.assertIn("LET $m = (SELECT VALUE { `t0`: $r.`t0`, `t1`: $this } FROM `tabOther` WHERE", sql)
+		self.assertIn("`title@ci` = $r.`t0`.`name@ci`", sql)
+		self.assertNotIn("$parent", sql)
+		self.assertIn("IF array::len($m) = 0 { [{ `t0`: $r.`t0`, `t1`: NONE }] } ELSE { $m }", sql)
 		# the conjunct on the joined table is applied after joining (a LEFT JOIN row without a match must not vanish silently)
 		self.assertRegex(sql, r"\) WHERE \(`t1`\.`note@ci` = \$param\d+\) ORDER BY `__o0` ASC")
+		self.assertNotIn(
+			"SELECT VALUE id FROM (SELECT id", sql
+		)  # a WHERE on the joined table: no page pushdown
 		self.assertTrue(
 			sql.endswith('/*cols:__c0,__c1*/ /*names:["name", "qty"]*/ /*kinds:varchar,int*/'), sql
 		)
 
-	def test_join_without_an_equality_is_a_correlated_sub_select(self):
+	def test_paged_left_join_selects_the_page_ids_first(self):
 		other = Table("tabOther")
-		sql, _ = r(q().left_join(other).on(other.qty > T.qty).select(T.name, other.qty))
-		self.assertNotIn("LET $j", sql)
-		self.assertIn("(SELECT VALUE { `t0`: $this } FROM `tabDoc`)", sql)
-		self.assertIn("LET $m = (SELECT VALUE { `t0`: $parent.`t0`, `t1`: $this } FROM `tabOther` WHERE", sql)
+		sql, _ = r(
+			q()
+			.left_join(other)
+			.on(other.title == T.name)
+			.select(T.name, other.qty)
+			.where(T.flag == 1)
+			.orderby(T.name)
+			.limit(20)
+			.offset(40)
+		)
+		self.assertIn(
+			"(SELECT VALUE { `t0`: $this } FROM (SELECT VALUE id FROM (SELECT id, `name@ci` AS `__p0` FROM `tabDoc` "
+			"WHERE (`flag` = $param1) ORDER BY `__p0` ASC LIMIT 60)))",
+			sql,
+		)
+		self.assertIn(
+			"ORDER BY `__o0` ASC LIMIT 20 START 40", sql
+		)  # the final page is still cut from the joined rows
 
 	def test_inner_join_and_star_keys(self):
 		other = Table("tabOther")
 		sql, _ = r(q().inner_join(other).on(other.title == T.name).select(T.name, other.name))
-		self.assertIn(
-			"array::flatten((SELECT VALUE (SELECT VALUE { `t0`: $parent.`t0`, `t1`: $this } FROM (IF", sql
-		)
+		self.assertIn("|$r| (SELECT VALUE { `t0`: $r.`t0`, `t1`: $this } FROM `tabOther`", sql)
 		self.assertNotIn("$m", sql)
 		self.assertIn("`t0`.`name` AS `__c0`, `t1`.`name` AS `__c1`", sql)
 		sql, _ = r(q().left_join(other).on(other.title == T.name).select(T.star, other.star))

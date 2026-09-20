@@ -348,7 +348,10 @@ def create_statements(
 		stmts.append(spec.define_field(table))
 		stmts += spec.define_shadows(table)
 
-	indexes = []
+	# MariaDB's PRIMARY KEY on `name`. The record id already makes names unique, but a lookup by `name@ci` (every join on a document
+	# name - Link fields, `parent`, `tabX.name = child.link` - and every `name IN (...)`) is a TableScan without an index: measured
+	# 57 ms per lookup on 5,178 rows vs 0.2 ms with it (findings/P1.6-builder.md section 9).
+	indexes = [("PRIMARY", [nm.index_field()], True)]
 	if is_child:
 		indexes.append(("parent", ["parent" + SHADOW_CI], False))
 	else:

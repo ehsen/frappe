@@ -514,6 +514,67 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 			self.both(f"posting_date {label}", self.select_all(crit), failures)
 		self.report(failures, "date-vs-datetime comparisons")
 
+	def test_paged_left_join_pages_the_first_table_before_joining(self):
+		"""LEFT JOIN + ORDER BY/LIMIT on the first table alone: only the page's parents are joined (ids first, then records)."""
+		p, k = T, K
+
+		def base(Q):
+			return (
+				Q.from_(p)
+				.left_join(k)
+				.on(k.parent == p.name)
+				.select(p.name, k.name, k.qty)
+				.where(p.flag == 1)
+			)
+
+		failures = []
+		for label, order in {
+			"name": lambda q: q.orderby(p.name),
+			"title, name": lambda q: q.orderby(p.title).orderby(p.name),
+			"qty desc, name": lambda q: q.orderby(p.qty, order=Order.desc).orderby(p.name),
+			"ifnull(note,'') , name": lambda q: q.orderby(fn.IfNull(p.note, "")).orderby(p.name),
+		}.items():
+			full = self.run_maria(lambda Q, order=order: order(base(Q)))
+			counts, last = [], object()
+			for row in full:
+				if row[0] != last:
+					counts.append(0)
+					last = row[0]
+				counts[-1] += 1
+			for first, n in [(0, 5), (3, 7), (10, 4), (0, 1)]:
+				offset, limit = sum(counts[:first]), sum(counts[first : first + n])
+				build = lambda Q, order=order, o=offset, li=limit: order(base(Q)).limit(li).offset(o)  # noqa: E731
+				self.both(
+					f"{label}: parents {first}..{first + n} (rows {offset}+{limit})",
+					build,
+					failures,
+					ordered=False,
+				)
+		self.report(failures, "paged left joins")
+
+		# a window that ends inside a parent: the right number of rows, all of them real rows, and the page pushdown is in the SQL
+		full = self.run_maria(lambda Q: base(Q).orderby(p.name))
+		build = lambda Q: base(Q).orderby(p.name).limit(7).offset(2)  # noqa: E731
+		got = self.run_surreal(build)
+		self.assertEqual(len(got), 7)
+		self.assertTrue({repr(r) for r in got} <= {repr(r) for r in full})
+		sql, _ = render(build(SurrealDB), None, self.loader)
+		self.assertIn("SELECT VALUE id FROM (SELECT id, ", sql)
+		self.assertIn("LIMIT 9)", sql)  # offset + limit parents at most
+		# no pushdown when the ordering uses the joined table, a WHERE touches it, or the join is an INNER JOIN
+		for other in (
+			lambda Q: base(Q).orderby(k.name).limit(7),
+			lambda Q: base(Q).where(k.qty > 5).orderby(p.name).limit(7),
+			lambda Q: Q.from_(p)
+			.inner_join(k)
+			.on(k.parent == p.name)
+			.select(p.name, k.name)
+			.orderby(p.name)
+			.limit(7),
+		):
+			sql, _ = render(other(SurrealDB), None, self.loader)
+			self.assertNotIn("SELECT VALUE id FROM (SELECT id, ", sql)
+
 	# --- joins ------------------------------------------------------------------------------------------------------------
 	def test_joins(self):
 		p, k = T, K
