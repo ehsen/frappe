@@ -26,7 +26,7 @@ upstream project.
 | P1.2 site provisioning (namespace, database, scoped user; create/drop) | implemented and tested against a live server, including `bench new-site` / `drop-site` up to bootstrap |
 | P1.3 driver boundary (connection, cursor, error mapping, transactions, parameters) | implemented and tested (fake SDK and live server) |
 | P1.4 schema: fieldtype mapping, DDL, introspection, collation shadow keys, sequences | implemented; all 271 table-backed Frappe DocTypes apply to SurrealDB and match MariaDB's columns and indexes with no unexplained difference |
-| P1.6 query translator: single-table SELECT (exact NULL and collation semantics), aggregates, GROUP BY, INSERT/UPDATE/DELETE | implemented and compared with MariaDB on identical data (167 predicates, orderings, writes, 41 aggregate cases); joins, functions and subqueries fail closed and are next |
+| P1.6 query translator: SELECT/INSERT/UPDATE/DELETE with exact NULL and collation semantics, aggregates, GROUP BY (incl. non-strict), expressions and functions, INNER/LEFT joins, uncorrelated sub-queries, upserts | implemented and compared with MariaDB on identical data (20 live parity tests, 24 golden tests); long-text comparisons, correlated sub-queries, right/full joins and unmapped functions fail closed |
 | ORM layer, locks and savepoints, raw-SQL rewrites, site install | not started |
 
 A site cannot be installed on SurrealDB yet (the framework bootstrap is still missing). Everything not implemented **fails closed**: it raises
