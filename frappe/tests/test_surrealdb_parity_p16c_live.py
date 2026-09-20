@@ -613,6 +613,31 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 			.select(p.name, k.name)
 			.where(k.qty > p.qty)
 			.orderby(k.name),
+			"join without an equality (nested loop)": lambda Q: Q.from_(p)
+			.inner_join(k)
+			.on(k.qty > p.qty)
+			.select(p.name, k.name)
+			.where(p.qty > 15)
+			.orderby(p.name)
+			.orderby(k.name),
+			"join on integer equality": lambda Q: Q.from_(p)
+			.inner_join(k)
+			.on(k.idx == p.flag)
+			.select(p.name, k.name)
+			.where(p.qty > 17)
+			.orderby(p.name)
+			.orderby(k.name),
+			"join on equality plus range": lambda Q: Q.from_(p)
+			.left_join(k)
+			.on((k.parent == p.name) & (k.ship_date > "2024-06-01") & (k.item != "widget"))
+			.select(p.name, k.name, k.ship_date)
+			.orderby(p.name)
+			.orderby(k.name),
+			"join on NULL keys": lambda Q: Q.from_(k)
+			.left_join(p)
+			.on(p.name == k.parent)
+			.select(k.name, p.title)
+			.orderby(k.name),
 			"join date functions": lambda Q: Q.from_(p)
 			.inner_join(k)
 			.on(k.parent == p.name)

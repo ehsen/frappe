@@ -1113,23 +1113,94 @@ class Renderer:
 			getattr(f, "table", None) is not None and self._same_table(main.table, f.table) for f in fields
 		)
 
+	def _hash_join_key(self, join, k: int):
+		"""(field of table k, field of an earlier table, mode) of an equality conjunct of the ON criterion usable as a hash key:
+		both varchar (compared by collation key) or both integers. None when there is none."""
+		ctx = self.ctxs[k]
+		for c in self._conjuncts(join.criterion):
+			if _kind(c) != "BasicCriterion" or _sql_word(c.comparator) != "=":
+				continue
+			if not (self._is_field(c.left) and self._is_field(c.right)):
+				continue
+			try:
+				owner_l, owner_r = self._owner(c.left), self._owner(c.right)
+			except SurrealDBProgrammingError:
+				continue
+			if owner_l is ctx and owner_r in self.ctxs[:k]:
+				mine, other = c.left, c.right
+			elif owner_r is ctx and owner_l in self.ctxs[:k]:
+				mine, other = c.right, c.left
+			else:
+				continue
+			a, b = ctx.schema.column(mine.name), self._owner(other).schema.column(other.name)
+			if a is None or b is None:
+				continue
+			if a.is_varchar and b.is_varchar:
+				return mine, other, "ci"
+			if a.kind in INT_KINDS and b.kind in INT_KINDS:
+				return mine, other, "int"
+		return None
+
+	def _key_sql(self, field, mode: str, prefix: str) -> str:
+		ctx = self._owner(field)
+		saved, ctx.prefix = ctx.prefix, prefix
+		try:
+			e = self._col(ctx, ctx.schema.column(field.name))
+		finally:
+			ctx.prefix = saved
+		return e.ci if mode == "ci" else f"<string>{e.sql}"
+
 	def _joined_source(self, joins, pushed_sql: str) -> str:
 		"""The rows of `FROM a JOIN b ON ...` as an array of `{t0: <a row>, t1: <b row or NONE>}` objects.
 
-		SurrealDB has no JOIN. Each join step is a sub-select per row of the previous step that looks up the matching rows of
-		the next table (an index lookup when the ON criterion is an equality on an indexed shadow), flattened. A LEFT JOIN keeps
-		a row without a match, with the joined side NONE (which every predicate treats as NULL)."""
+		SurrealDB has no JOIN. A join step looks up, for every row of the previous step, the matching rows of the next table; a
+		LEFT JOIN keeps a row without a match, with the joined side NONE (which every predicate treats as NULL).
+
+		The lookup is a *hash join* when the ON criterion has an equality on collation keys or integers (`child.parent = doc.name`,
+		which is what Frappe joins on): the keys of the previous rows are collected, the next table is read once for those keys
+		and grouped into an object `key -> [record ids]`, and each previous row fetches its candidates by record id. That is
+		O(left + right). (Measured: a correlated `WHERE parent@ci = $parent.x@ci` is a TableScan per left row in SurrealDB
+		3.2.4 - the planner uses an index only for constants and bound parameters - so the direct form is O(left x right).)
+		Without such an equality the correlated form is used: correct, but quadratic. The whole ON criterion is always
+		re-applied to the candidates."""
 		ctxs = self.ctxs
 		where = f" WHERE {pushed_sql}" if pushed_sql else ""
 		source = f"(SELECT VALUE {{ `t0`: $this }} FROM {quote_table(ctxs[0].schema.name)}{where})"
 		for k in range(1, len(ctxs)):
 			ctx, join = ctxs[k], joins[k - 1]
+			hash_key = self._hash_join_key(join, k)
+			candidates = quote_table(ctx.schema.name)
+			if hash_key is not None:
+				mine, other, mode = hash_key
+				self.shared.counter += 1
+				n = self.shared.counter
+				rows, keys, groups, index = f"$jr{n}", f"$jk{n}", f"$jc{n}", f"$jm{n}"
+				own = self._key_sql(mine, mode, "")
+				left_key = self._key_sql(other, mode, f"`{self._owner(other).alias}`.")
+				left_lookup = self._key_sql(other, mode, f"$parent.`{self._owner(other).alias}`.")
+				raw_left = left_lookup.removeprefix("<string>")
+				prelude = self.shared.prelude
+				prelude.append(f"LET {rows} = {source}")
+				prelude.append(
+					f"LET {keys} = array::complement(array::distinct((SELECT VALUE {left_key} FROM {rows})), [NULL, NONE])"
+				)
+				prelude.append(
+					f"LET {groups} = (SELECT {own} AS `k`, id AS `ids` FROM {quote_table(ctx.schema.name)} "
+					f"WHERE {own} IN {keys} GROUP BY `k`)"
+				)
+				prelude.append(
+					f"LET {index} = object::from_entries((SELECT VALUE [`k`, `ids`] FROM {groups}))"
+				)
+				candidates = f"(IF {_absent(raw_left)[1:-1]} THEN [] ELSE ({index}[{left_lookup}] ?? []) END)"
+				source = rows
 			for earlier in ctxs[:k]:
 				earlier.prefix = f"$parent.`{earlier.alias}`."
 			ctx.prefix = ""
 			condition = self.predicate(join.criterion)
 			carried = ", ".join(f"`{c.alias}`: $parent.`{c.alias}`" for c in ctxs[:k])
-			matched = f"SELECT VALUE {{ {carried}, `{ctx.alias}`: $this }} FROM {quote_table(ctx.schema.name)} WHERE {condition}"
+			matched = (
+				f"SELECT VALUE {{ {carried}, `{ctx.alias}`: $this }} FROM {candidates} WHERE {condition}"
+			)
 			if _attr_name(join.how).lower() == "":
 				source = f"(array::flatten((SELECT VALUE ({matched}) FROM {source})))"
 			else:
