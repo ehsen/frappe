@@ -17,6 +17,7 @@ Storage model (ADR 0001, findings/P0.3, findings/P1.4):
   `has_index` / `get_column_index` keep working.
 """
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -643,6 +644,26 @@ def decode_kind(k: str, value):
 
 
 # --- system tables -------------------------------------------------------------------------------------------------
+# Primary/unique key of each system table: the record id is a hash of the collation keys of these columns (the tables have no `name`
+# key of their own: `__Auth.name` repeats for every field of a document)
+SYSTEM_KEYS = {
+	"__Auth": ("doctype", "name", "fieldname"),
+	"__global_search": ("doctype", "name"),
+	"__UserSettings": ("user", "doctype"),
+}
+
+
+def system_record_id(table: str, row: dict) -> str:
+	"""Record id of a system-table row from its key columns (`row` maps column -> stored value)."""
+	parts = []
+	for column in SYSTEM_KEYS[table]:
+		value = row.get(column)
+		if value is None:
+			raise SurrealDBProgrammingError(1048, f"Column '{column}' cannot be null")
+		parts.append(collation.ci_key(values.to_str(value)))
+	return "~" + hashlib.blake2b(json.dumps(parts).encode(), digest_size=16).hexdigest()
+
+
 def system_table_statements(name: str) -> list[str]:
 	"""Tables Frappe creates outside DocType sync (`create_auth_table` etc.), same columns as MariaDB's."""
 	if name == "__Auth":

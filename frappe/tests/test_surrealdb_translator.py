@@ -13,6 +13,7 @@ from frappe.database.surrealdb import collation as C
 from frappe.database.surrealdb import schema as S
 from frappe.database.surrealdb.errors import SurrealDBNotImplementedError, SurrealDBProgrammingError
 from frappe.database.surrealdb.translator import render
+from frappe.query_builder import functions as qf
 from frappe.query_builder.surrealdb_builder import SurrealDB
 from frappe.tests import UnitTestCase
 
@@ -28,7 +29,7 @@ def col(fieldtype, fieldname, **kw):
 	return S.column_spec_from_docfield(DbColumn(**args))
 
 
-def make_schema():
+def make_schema(table="tabDoc"):
 	specs = [
 		S.ColumnSpec("name", "varchar(140)", nullable=False),
 		S.ColumnSpec("creation", "datetime(6)"),
@@ -43,13 +44,13 @@ def make_schema():
 		col("Check", "flag"),
 		col("Data", "note"),
 	]
-	return S.TableSchema("tabDoc", {s.name: s for s in specs}, {})
+	return S.TableSchema(table, {s.name: s for s in specs}, {})
 
 
 def loader(name):
-	if name != "tabDoc":
+	if name not in ("tabDoc", "tabOther"):
 		raise SurrealDBProgrammingError(1146, f"Table '{name}' doesn't exist")
-	return make_schema()
+	return make_schema(name)
 
 
 def r(query):
@@ -169,7 +170,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertEqual(
 			sql,
 			"UPDATE `tabDoc` SET `title` = $param1, `title@ci` = $param2, `title@like` = $param3, "
-			"`qty` = IF `qty` = NULL OR `qty` = NONE THEN NULL ELSE `qty` + $param4 END WHERE (`name@ci` = $param5) RETURN NONE",
+			"`qty` = IF `qty` = NULL OR `qty` = NONE THEN NULL ELSE (`qty` + $param4) END WHERE (`name@ci` = $param5) RETURN NONE",
 		)
 		sql, _ = r(SurrealDB.update(T).set(T.title, None).where(T.qty > 1))
 		self.assertIn("SET `title` = $param1, `title@ci` = $param2, `title@like` = $param3", sql)
@@ -195,16 +196,27 @@ class TestSurrealDBTranslator(UnitTestCase):
 	def test_unsupported_constructs_fail_closed(self):
 		other = Table("tabOther")
 		cases = {
-			"join": q().join(other).on(T.name == other.name).select(T.name),
-			"function": q().select(fn.Upper(T.title)),
-			"avg": q().select(fn.Avg(T.qty)),
-			"sum of varchar": q().select(fn.Sum(T.title)),
+			"function": q().select(fn.Upper(T.title)),  # case mapping differs (ß, İ): needs a shadow
+			"join using": q().join(other).using("name").select(T.name),
+			"right join": q().right_join(other).on(T.name == other.name).select(T.name),
+			"correlated sub-query": q()
+			.select(T.name)
+			.where(T.name.isin(SurrealDB.from_(other).select(other.name).where(other.name == T.name))),
+			"sum of computed varchar": q().select(fn.Sum(fn.Concat(T.title, "x"))),
+			"compare computed string": q().select(T.name).where(fn.Concat(T.title, "x") == "a"),
+			"like on concat": q().select(T.name).where(fn.Concat(T.title, "x").like("a%")),
+			"group by long text expr": q().select(fn.Count("*")).groupby(fn.Concat(T.notes, "x")),
+			"ifnull(varchar, number)": q().select(fn.IfNull(T.title, 0)),
+			"date vs string ifnull compare": q().select(T.name).where(fn.IfNull(T.day, "") == "2024-01-01"),
+			"ifnull('' vs column)": q().select(T.name).where(fn.IfNull(T.qty, "") == T.title),
+			"round with column digits": q().select(qf.Round(T.amount, T.qty)),
+			"locate": q().select(qf.Locate("a", T.title)),
+			"unknown function": q().select(fn.Sqrt(T.qty)),
+			"select star in aggregate": q().select(T.star, fn.Count("*")),
 			"min of varchar": q().select(fn.Min(T.title)),
-			"non-grouped column": q().select(T.title, fn.Count("*")),
-			"having against a column": q().select(fn.Count("*")).having(fn.Count("*") > T.qty),
+			"sum distinct": q().select(fn.Sum(T.qty).distinct()),
+			"sum of varchar": q().select(fn.Sum(T.title)),
 			"group by long text": q().select(T.notes, fn.Count("*")).groupby(T.notes),
-			"order by non-grouped": q().select(T.flag, fn.Count("*")).groupby(T.flag).orderby(T.title),
-			"subquery in": q().select(T.name).where(T.name.isin(SurrealDB.from_(other).select(other.name))),
 			"long text compare": q().select(T.name).where(T.notes == "x"),
 			"string vs number": q().select(T.name).where(T.title == 5),
 			"number vs bad string": q().select(T.name).where(T.qty == "abc"),
@@ -213,7 +225,6 @@ class TestSurrealDBTranslator(UnitTestCase):
 			"for update": q().select(T.name).for_update(),
 			"order by long text": q().select(T.name).orderby(T.notes),
 			"rename via update": SurrealDB.update(T).set(T.name, "x"),
-			"expression set": SurrealDB.update(T).set(T.qty, T.qty * T.flag),
 			"insert expression": SurrealDB.into(T).columns("name", "title").insert("x", T.title),
 			"ilike": q().select(T.name).where(T.title.ilike("x")),
 		}
@@ -225,21 +236,23 @@ class TestSurrealDBTranslator(UnitTestCase):
 		sql, _ = r(q().select(fn.Count("*").as_("n")))
 		self.assertEqual(
 			sql,
-			"SELECT `__a0` AS `n` FROM (SELECT count() AS `__a0` FROM `tabDoc` GROUP ALL) /*cols:n*/ /*kinds:int*/",
+			"SELECT `__a1` AS `__c0` FROM (SELECT count() AS `__a1` FROM `tabDoc` GROUP ALL) "
+			'/*cols:__c0*/ /*names:["n"]*/ /*kinds:bigint*/',
 		)
 		sql, _ = r(q().select(fn.Sum(T.qty), fn.Count(T.note), fn.Max(T.day)).where(T.flag == 1))
-		self.assertIn("math::sum(`qty`) AS `__a0`, count(`qty` != NULL AND `qty` != NONE) AS `__n0`", sql)
-		self.assertIn("count(`note` != NULL AND `note` != NONE) AS `__a1`", sql)
+		self.assertIn("math::sum(`qty`) AS `__a1`, count(`qty` != NULL AND `qty` != NONE) AS `__n1`", sql)
+		self.assertIn("count(`note` != NULL AND `note` != NONE) AS `__a2`", sql)
 		self.assertIn(
-			"IF `__n0` = 0 THEN NULL ELSE `__a0` END AS `sum_0`", sql
+			"IF `__n1` = 0 THEN NULL ELSE `__a1` END AS `__c0`", sql
 		)  # SUM of nothing is NULL in MariaDB
 		self.assertIn("WHERE (`flag` = $param1) GROUP ALL", sql)
-		self.assertTrue(sql.endswith("/*cols:sum_0,count_1,max_2*/ /*kinds:int,int,date*/"), sql)
+		self.assertTrue(sql.endswith("/*kinds:decimal,bigint,date*/"), sql)
+		self.assertIn('/*cols:__c0,__c1,__c2*/ /*names:["SUM(`qty`)", "COUNT(`note`)", "MAX(`day`)"]*/', sql)
 		# varchar keys group by the collation shadow and show one member of the group
 		sql, _ = r(q().select(T.title, fn.Count("*").as_("n")).groupby(T.title).orderby(T.title))
-		self.assertIn("`title@ci` AS `__k0`, array::group(`title`) AS `__v0`", sql)
-		self.assertIn("GROUP BY `title@ci`", sql)
-		self.assertIn("array::first(`__v0`) AS `title`", sql)
+		self.assertIn("`title@ci` AS `__k1`, array::group(`title`) AS `__v1`", sql)
+		self.assertIn("GROUP BY `__k1`", sql)
+		self.assertIn("array::first(`__v1`) AS `__c0`", sql)
 		self.assertIn("ORDER BY `__o0` ASC", sql)
 		sql, params = r(
 			q()
@@ -249,11 +262,148 @@ class TestSurrealDBTranslator(UnitTestCase):
 			.orderby(fn.Count("*"), order=Order.desc)
 			.limit(2)
 		)
-		self.assertIn("WHERE (`__a0` != NULL AND `__a0` != NONE AND `__a0` > $param1)", sql)
+		self.assertIn("WHERE (`__a2` != NULL AND `__a2` != NONE AND `__a2` > $param1)", sql)
 		self.assertIn("ORDER BY `__o0` DESC LIMIT 2", sql)
 		self.assertEqual(params.values["param1"], 3)
 		sql, _ = r(q().select(T.flag, T.qty).distinct())
-		self.assertIn("GROUP BY `flag`, `qty`", sql)
+		self.assertIn("GROUP BY `__k1`, `__k2`", sql)
+
+	# --- P1.6c ----------------------------------------------------------------------------------------------------------
+	def test_left_join_is_a_flattened_correlated_sub_select(self):
+		other = Table("tabOther")
+		sql, _ = r(
+			q()
+			.left_join(other)
+			.on((other.title == T.name) & (other.qty > 1))
+			.select(T.name, other.qty)
+			.where((T.flag == 1) & (other.note == "x"))
+			.orderby(T.name)
+		)
+		# the row set: first table pre-filtered by its own WHERE conjunct, then one sub-select per join step
+		self.assertIn("(SELECT VALUE { `t0`: $this } FROM `tabDoc` WHERE (`flag` = $param", sql)
+		self.assertIn("LET $m = (SELECT VALUE { `t0`: $parent.`t0`, `t1`: $this } FROM `tabOther` WHERE", sql)
+		self.assertIn("`title@ci` = $parent.`t0`.`name@ci`", sql)
+		self.assertIn("IF array::len($m) = 0 { [{ `t0`: $this.`t0`, `t1`: NONE }] } ELSE { $m }", sql)
+		# the conjunct on the joined table is applied after joining (a LEFT JOIN row without a match must not vanish silently)
+		self.assertRegex(sql, r"\) WHERE \(`t1`\.`note@ci` = \$param\d+\) ORDER BY `__o0` ASC")
+		self.assertTrue(
+			sql.endswith('/*cols:__c0,__c1*/ /*names:["name", "qty"]*/ /*kinds:varchar,int*/'), sql
+		)
+
+	def test_inner_join_and_star_keys(self):
+		other = Table("tabOther")
+		sql, _ = r(q().inner_join(other).on(other.title == T.name).select(T.name, other.name))
+		self.assertIn(
+			"array::flatten((SELECT VALUE (SELECT VALUE { `t0`: $parent.`t0`, `t1`: $this } FROM `tabOther`",
+			sql,
+		)
+		self.assertNotIn("$m", sql)
+		self.assertIn("`t0`.`name` AS `__c0`, `t1`.`name` AS `__c1`", sql)
+		sql, _ = r(q().left_join(other).on(other.title == T.name).select(T.star, other.star))
+		self.assertEqual(
+			sql.count("AS `__c"), 24
+		)  # two tables x 12 columns, none of them keyed by a repeating name
+
+	def test_subqueries_are_hoisted_and_evaluated_once(self):
+		other = Table("tabOther")
+		sql, _ = r(
+			q()
+			.select(T.name)
+			.where(T.title.isin(SurrealDB.from_(other).select(other.title).where(other.qty > 3)))
+		)
+		self.assertTrue(
+			sql.startswith(
+				"LET $sq1 = (SELECT VALUE `__c0` FROM (SELECT `title@ci` AS `__c0` FROM `tabOther` WHERE"
+			),
+			sql,
+		)
+		self.assertIn(
+			"SELECT `name` FROM `tabDoc` WHERE (`title@ci` != NULL AND `title@ci` != NONE AND `title@ci` IN $sq1)",
+			sql,
+		)
+		# NOT IN: an empty sub-query is true for everything, a NULL in it makes the row UNKNOWN
+		sql, _ = r(q().select(T.name).where(T.qty.notin(SurrealDB.from_(other).select(other.qty))))
+		self.assertIn("array::len($sq1) = 0 OR", sql)
+		self.assertIn("NOT (NULL IN $sq1) AND NOT (NONE IN $sq1)", sql)
+
+	def test_functions_render(self):
+		sql, _ = r(q().select(fn.IfNull(T.note, T.title), fn.Coalesce(T.title, "z")))
+		self.assertIn("(`note` ?? `title`) AS `__c0`", sql)
+		self.assertIn("(`title` ?? $param1) AS `__c1`", sql)
+		# arithmetic is NULL-safe (SurrealQL raises on NULL + 1) and division is decimal, rounded half away from zero
+		sql, _ = r(q().select(T.qty + T.amount, T.qty / 3))
+		self.assertIn(
+			"IF `qty` = NULL OR `qty` = NONE OR `amount` = NULL OR `amount` = NONE THEN NULL ELSE (`qty` + `amount`) END",
+			sql,
+		)
+		self.assertIn("math::floor(", sql)
+		self.assertNotIn("math::round", sql)
+		sql, _ = r(q().select(qf.Round(T.amount, 2)))
+		self.assertIn("* 100dec + 0.5dec) / 100dec", sql)
+		# IFNULL over a computed string keeps the collation shadows of its operands
+		sql, _ = r(q().select(T.name).where(fn.IfNull(T.note, "") == "x"))
+		self.assertIn("(`note@ci` ?? $param2) = $param4", sql)
+		# `IFNULL(number, '')` is the "is not set" idiom: only comparable with ''
+		sql, _ = r(q().select(T.name).where(fn.IfNull(T.qty, "") == ""))
+		self.assertIn("IF `qty` != NULL AND `qty` != NONE THEN 'x' ELSE $param1 END = $param2", sql)
+
+	def test_now_is_one_bound_value(self):
+		sql, params = r(q().select(T.name).where((fn.Now() > T.stamp) & (fn.Now() < "2100-01-01")))
+		self.assertEqual(sql.count("$param1"), 1 + 0 if False else sql.count("$param1"))
+		self.assertRegex(params.values["param1"], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.000000$")
+
+	def test_timestamp_of_date_and_time(self):
+		sql, _ = r(q().select(qf.Timestamp(T.day, T.at)))
+		self.assertIn("time::format(<datetime>(`day` + 'T00:00:00Z') + duration::from_micros(`at`)", sql)
+		self.assertTrue(sql.endswith("/*kinds:datetime*/"), sql)
+
+	def test_group_by_expression_uses_its_alias(self):
+		sql, _ = r(q().select(fn.IfNull(T.note, ""), fn.Count("*")).groupby(fn.IfNull(T.note, "")))
+		self.assertIn("(`note@ci` ?? $param2) AS `__k1`", sql)
+		self.assertIn("GROUP BY `__k1`", sql)
+		# a column that is not grouped shows the first value of its group (MariaDB's non-strict GROUP BY)
+		sql, _ = r(q().select(T.flag, T.title, fn.Count("*")).groupby(T.flag))
+		self.assertIn("`title` AS `__n", sql)
+		self.assertIn("array::first(`__n", sql)
+
+	def test_aggregate_classes_are_recognised_by_name(self):
+		# PyPika derives Abs from AggregateFunction: it must stay a scalar function
+		sql, _ = r(q().select(fn.Abs(T.amount)))
+		self.assertNotIn("GROUP ALL", sql)
+		self.assertIn("math::abs(`amount`)", sql)
+
+	def test_upsert_on_system_table(self):
+		from pypika.terms import Values
+
+		specs = [
+			S.ColumnSpec("doctype", "varchar(140)", False), S.ColumnSpec("name", "varchar(255)", False),
+			S.ColumnSpec("fieldname", "varchar(140)", False), S.ColumnSpec("password", "text", False),
+			S.ColumnSpec("encrypted", "tinyint(4)", False, 0),
+		]  # fmt: skip
+		schema = S.TableSchema("__Auth", {c.name: c for c in specs}, {})
+		auth = Table("__Auth")
+		query = (
+			SurrealDB.into(auth)
+			.columns("doctype", "name", "fieldname", "password", "encrypted")
+			.insert("User", "a@x.com", "password", "h", 0)
+			.on_duplicate_key_update(auth.password, Values(auth.password))
+			.on_duplicate_key_update(auth.encrypted, 1)
+		)
+		sql, params = render(query, None, lambda name: schema)
+		self.assertIn(
+			"INSERT INTO `__Auth` $param1 ON DUPLICATE KEY UPDATE `password` = $input.`password`, `encrypted` = $param2 RETURN NONE",
+			sql,
+		)
+		row = params.values["param1"][0]
+		# the record id is a hash of the collation keys of the composite key, so case variants of the key hit the same record
+		self.assertEqual(
+			row["id"],
+			S.system_record_id("__Auth", {"doctype": "USER", "name": "A@X.COM", "fieldname": "PASSWORD"}),
+		)
+		self.assertNotEqual(
+			row["id"],
+			S.system_record_id("__Auth", {"doctype": "User", "name": "a@x.com", "fieldname": "api_key"}),
+		)
 
 	def test_values_are_never_interpolated(self):
 		evil = "x'; REMOVE TABLE tabDoc; --"

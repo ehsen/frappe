@@ -64,10 +64,24 @@ class TestSurrealDBDispatch(UnitTestCase):
 			SurrealDB.from_("ToDo").select("name").for_update().get_sql()
 
 	def test_query_functions_without_a_surrealdb_mapping_fail_closed(self):
-		from frappe.query_builder.functions import GroupConcat
+		from frappe.query_builder.functions import Locate, Match
 
-		with _conf("surrealdb"), self.assertRaises(SurrealDBNotImplementedError):
-			GroupConcat("name")
+		for function in (Locate, Match):
+			with _conf("surrealdb"), self.assertRaises(SurrealDBNotImplementedError):
+				function("name", "x")
+
+	def test_query_functions_the_translator_renders_are_mapped(self):
+		from frappe.query_builder.custom import GROUP_CONCAT
+		from frappe.query_builder.functions import CombineDatetime, DateFormat, GroupConcat, UnixTimestamp
+
+		with _conf("surrealdb"):
+			self.assertIsInstance(GroupConcat("name"), GROUP_CONCAT)
+			for term in (
+				CombineDatetime("posting_date", "posting_time"),
+				DateFormat("creation", "%Y"),
+				UnixTimestamp("creation"),
+			):
+				self.assertTrue(hasattr(term, "args"))
 
 	def test_default_port_and_health_probe_do_not_use_another_engines_port(self):
 		from frappe.utils import connections

@@ -45,6 +45,7 @@ WRITE_STARTS = ("create", "insert", "update", "upsert", "delete", "relate", "def
 _FIRST_WORD = re.compile(r"^\s*(\w+)")
 # `/*cols:a,b,c*/` anywhere in the query text: the projection order emitted by the translator (see SurrealCursor)
 _KINDS_HINT = re.compile(r"/\*\s*kinds:\s*([\w,]*)\s*\*/")
+_NAMES_HINT = re.compile(r"/\*\s*names:\s*(\[.*?\])\s*\*/", re.S)
 _COLUMNS_HINT = re.compile(r"/\*\s*cols:\s*(\w+(?:\s*,\s*\w+)*)\s*\*/")
 _TEMPORAL = (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)
 
@@ -364,18 +365,20 @@ class SurrealCursor:
 		columns = [c.strip() for c in hint[1].split(",")] if hint else None
 		kinds_hint = _KINDS_HINT.search(text)
 		kinds = kinds_hint[1].split(",") if kinds_hint else None
+		names_hint = _NAMES_HINT.search(text)
+		names = json.loads(names_hint[1].replace("\\/", "/")) if names_hint else None
 		results = self.connection.execute(text, values)
 		last = results[-1] if results else None
 		if last_statement_word(text) in WRITE_STARTS:
 			# MariaDB returns no result set for writes, only a row count
 			self.rowcount = len(last) if isinstance(last, list) else 0
 		else:
-			self._shape(last, columns)
+			self._shape(last, columns, names)
 			if kinds:
 				self._decode(kinds)
 		return None
 
-	def _shape(self, result, hint=None):
+	def _shape(self, result, hint=None, names=None):
 		"""Turn a statement result into DB-API columns/rows. Rows are dicts (`SELECT`) or scalars (`SELECT VALUE`)."""
 		if result is None:
 			result = []
@@ -398,7 +401,7 @@ class SurrealCursor:
 		else:
 			columns = ["value"]
 			table = [(row,) for row in rows]
-		self.description = tuple((name, None, None, None, None, None, None) for name in columns)
+		self.description = tuple((name, None, None, None, None, None, None) for name in (names or columns))
 		self._rows = tuple(table)
 		self.rowcount = len(table)
 

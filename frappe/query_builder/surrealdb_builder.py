@@ -1,5 +1,6 @@
 from pypika import Query
 from pypika.queries import QueryBuilder
+from pypika.terms import Field, ValueWrapper
 from pypika.utils import builder
 
 from frappe.query_builder.builder import Base
@@ -16,16 +17,25 @@ class SurrealDBQueryBuilder(QueryBuilder):
 	def __init__(self, **kwargs):
 		super().__init__(dialect=None, **kwargs)
 		self._ignore = False
+		self._duplicate_updates = []
 
 	def __copy__(self):
 		clone = super().__copy__()
 		clone._ignore = self._ignore
+		clone._duplicate_updates = list(self._duplicate_updates)
 		return clone
 
 	@builder
 	def ignore(self):
 		"""`INSERT IGNORE`: rows whose record id already exists are skipped, like MariaDB's."""
 		self._ignore = True
+
+	@builder
+	def on_duplicate_key_update(self, field, value):
+		"""`INSERT .. ON DUPLICATE KEY UPDATE field = value` (same call as PyPika's MySQL builder; `Values(field)` allowed)."""
+		self._duplicate_updates.append(
+			(field if isinstance(field, Field) else Field(field), ValueWrapper(value))
+		)
 
 	def get_sql(self, *args, **kwargs):
 		# lazy: importing frappe.database at module level is circular while frappe/query_builder initialises

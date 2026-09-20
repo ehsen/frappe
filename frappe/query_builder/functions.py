@@ -65,7 +65,9 @@ class Truncate(Function):
 		super().__init__("TRUNCATE", term, decimal, **kwargs)
 
 
-GroupConcat = ImportMapper({db_type_is.MARIADB: GROUP_CONCAT, db_type_is.POSTGRES: STRING_AGG})
+GroupConcat = ImportMapper(
+	{db_type_is.MARIADB: GROUP_CONCAT, db_type_is.POSTGRES: STRING_AGG, db_type_is.SURREALDB: GROUP_CONCAT}
+)
 
 Match = ImportMapper({db_type_is.MARIADB: MATCH, db_type_is.POSTGRES: TO_TSVECTOR})
 
@@ -83,17 +85,21 @@ class _PostgresTimestamp(ArithmeticExpression):
 		super().__init__(operator=Arithmetic.add, left=datepart, right=timepart, alias=alias)
 
 
+_combine_datetime = CustomFunction("TIMESTAMP", ["date", "time"])
 CombineDatetime = ImportMapper(
 	{
-		db_type_is.MARIADB: CustomFunction("TIMESTAMP", ["date", "time"]),
+		db_type_is.MARIADB: _combine_datetime,
 		db_type_is.POSTGRES: _PostgresTimestamp,
+		db_type_is.SURREALDB: _combine_datetime,  # rendered by frappe/database/surrealdb/translator.py
 	}
 )
 
+_date_format = CustomFunction("DATE_FORMAT", ["date", "format"])
 DateFormat = ImportMapper(
 	{
-		db_type_is.MARIADB: CustomFunction("DATE_FORMAT", ["date", "format"]),
+		db_type_is.MARIADB: _date_format,
 		db_type_is.POSTGRES: ToChar,
+		db_type_is.SURREALDB: _date_format,
 	}
 )
 
@@ -111,10 +117,12 @@ class _PostgresUnixTimestamp(Extract):
 		self.field = field
 
 
+_unix_timestamp = CustomFunction("unix_timestamp", ["date"])
 UnixTimestamp = ImportMapper(
 	{
-		db_type_is.MARIADB: CustomFunction("unix_timestamp", ["date"]),
+		db_type_is.MARIADB: _unix_timestamp,
 		db_type_is.POSTGRES: _PostgresUnixTimestamp,
+		db_type_is.SURREALDB: _unix_timestamp,
 	}
 )
 
