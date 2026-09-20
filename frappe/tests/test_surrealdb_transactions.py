@@ -62,6 +62,19 @@ class TestSurrealDBTransactions(UnitTestCase):
 
 		self.assertEqual(str(cas[0][2]["r"].id), collation.record_id("tabT:a"))
 
+	def test_record_ids_survive_a_missing_sdk(self):
+		# the ledger benches run without the SDK; `lock_record_id`/`fence_record_id` must fall back to
+		# the name-compatible stand-in instead of erroring (the P1.8 ledger run hit exactly this)
+		from frappe.database.surrealdb import collation
+		from frappe.database.surrealdb.transactions import fence_record_id, lock_record_id
+
+		with patch.dict("sys.modules", {"surrealdb": None}):
+			rid = lock_record_id("tabT:a")
+			fid = fence_record_id("tabT:a")
+		self.assertEqual(type(rid).__name__, "RecordID")
+		self.assertEqual((rid.table_name, str(rid.id)), ("__lock", collation.record_id("tabT:a")))
+		self.assertEqual((fid.table_name, str(fid.id)), ("__fence", collation.record_id("tabT:a")))
+
 	def test_applock_waits_for_the_holder_then_times_out(self):
 		state = {"n": 0}
 

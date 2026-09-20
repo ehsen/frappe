@@ -70,21 +70,35 @@ class LockTimeout(Exception):
 	"""The lock was not granted within the timeout (blocking) or was held (NOWAIT). -> QueryTimeoutError."""
 
 
+class RecordID:
+	"""Stand-in with the SDK's class name and shape (`table_name`, `id`), used only when the SDK is
+	not installed — the driver keys on the class name, so fake-server runs work without the SDK."""
+
+	def __init__(self, table_name, id):
+		self.table_name, self.id = table_name, id
+
+
+def _record_id_cls():
+	"""The SDK's `RecordID` when importable, else the stand-in above. The SDK import stays lazy:
+	the backend package must not import the SDK (`test_surrealdb_driver`)."""
+	try:
+		from surrealdb import RecordID as sdk_record_id
+	except ImportError:
+		return RecordID
+	return sdk_record_id
+
+
 def lock_record_id(key: str):
 	"""`__lock` record id for a lock key. `collation.record_id` maps every character to a valid record id."""
-	from surrealdb import RecordID
-
 	from frappe.database.surrealdb.collation import record_id
 
-	return RecordID(LOCK_TABLE, record_id(key))
+	return _record_id_cls()(LOCK_TABLE, record_id(key))
 
 
 def fence_record_id(key: str):
-	from surrealdb import RecordID
-
 	from frappe.database.surrealdb.collation import record_id
 
-	return RecordID(FENCE_TABLE, record_id(key))
+	return _record_id_cls()(FENCE_TABLE, record_id(key))
 
 
 def jittered_backoff(attempt: int) -> float:
