@@ -432,6 +432,88 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 			self.both(label, lambda Q, term=term: Q.from_(k).select(k.name, term()).orderby(k.name), failures)
 		self.report(failures, "child-table function cases")
 
+	def test_empty_string_compares_as_zero_of_the_column_type(self):
+		"""Frappe's `is set` on a Date/Int field is `col <> ''`; MariaDB reads '' as 0000-00-00 / 0 / 00:00:00."""
+
+		def insert(Q):
+			return (
+				Q.into(T)
+				.columns("name", "posting_date", "stamp", "at", "qty", "amount", "flag")
+				.insert("ZERO-1", "0000-00-00", "0000-00-00 00:00:00", "00:00:00", 0, 0, 0)
+				.insert("ZERO-2", "2024-01-01", "2024-01-01 00:00:00", "00:00:01", 3, 1, 1)
+			)
+
+		insert(MariaDB).run()
+		frappe.db.commit()
+		sql, params = render(insert(SurrealDB), None, self.loader)
+		self.sdb.sql(sql, params.values)
+		self.sdb.commit()
+		failures = []
+		for col_ in ("posting_date", "stamp", "at", "qty", "amount", "flag"):
+			numeric = col_ in ("qty", "amount", "flag")
+			for label, crit in {
+				"= ''": lambda c=col_: T[c] == "",
+				"!= ''": lambda c=col_: T[c] != "",
+				"NOT (= '')": lambda c=col_: ~(T[c] == ""),
+				"IN ('', x)": lambda c=col_, n=numeric: T[c].isin(["", "1"] if n else [""]),
+			}.items():
+				self.both(f"{col_} {label}", self.select_all(crit), failures)
+		self.report(failures, "empty-string comparisons")
+
+	def test_long_text_is_set_is_exact_without_a_shadow(self):
+		"""`long_text = ''` / `<> ''` (Frappe's "is not set" / "is set") needs no collation shadow: a string equals '' under
+		utf8mb4_unicode_ci PAD SPACE when every character weighs nothing or only the space weight."""
+
+		def insert(Q):
+			q = Q.into(T).columns("name", "notes")
+			for i, v in enumerate(
+				["", "   ", "\t", "\u200b", " a ", "\u00a0", "\u3000 ", "\x01", "x", "\u200b \u200b"]
+			):
+				q = q.insert(f"EMP-{i}", v)
+			return q
+
+		insert(MariaDB).run()
+		frappe.db.commit()
+		sql, params = render(insert(SurrealDB), None, self.loader)
+		self.sdb.sql(sql, params.values)
+		self.sdb.commit()
+		failures = []
+		for label, crit in {
+			"notes = ''": lambda: T.notes == "",
+			"notes != ''": lambda: T.notes != "",
+			"NOT (notes = '')": lambda: ~(T.notes == ""),
+			"notes = '  ' (equal to '')": lambda: T.notes == "  ",
+			"ifnull(notes,'') = ''": lambda: fn.IfNull(T.notes, "") == "",
+			"ifnull(notes,'') != ''": lambda: fn.IfNull(T.notes, "") != "",
+			"and with title": lambda: (T.notes != "") & (T.qty > 3),
+		}.items():
+			self.both(label, self.select_all(crit), failures)
+		self.both(
+			"select ifnull(notes,'')",
+			lambda Q: Q.from_(T).select(T.name, fn.IfNull(T.notes, "")).orderby(T.name),
+			failures,
+		)
+		self.report(failures, "long-text emptiness")
+
+	def test_date_column_against_datetime_literals(self):
+		"""MariaDB compares a DATE with a datetime literal as a DATETIME (the date at midnight)."""
+		failures = []
+		for label, crit in {
+			"= midnight": lambda: T.posting_date == "2024-01-05 00:00:00",
+			"= 10:00": lambda: T.posting_date == "2024-01-05 10:00:00",
+			"< 10:00": lambda: T.posting_date < "2024-01-05 10:00:00",
+			"<= midnight": lambda: T.posting_date <= "2024-01-05 00:00:00",
+			"> 10:00": lambda: T.posting_date > "2024-01-05 10:00:00",
+			">= 10:00": lambda: T.posting_date >= "2024-01-05 10:00:00.5",
+			"!= 10:00": lambda: T.posting_date != "2024-01-05 10:00:00",
+			"between": lambda: T.posting_date.between("2024-01-01 00:00:00", "2024-02-29 12:00:00"),
+			"not between": lambda: ~T.posting_date.between("2024-01-01 00:00:00", "2024-02-29 12:00:00"),
+			"in": lambda: T.posting_date.isin(["2024-01-05 00:00:00", "2023-12-31 00:00:00"]),
+			"datetime object": lambda: T.posting_date >= dt.datetime(2024, 1, 5, 0, 0, 1),
+		}.items():
+			self.both(f"posting_date {label}", self.select_all(crit), failures)
+		self.report(failures, "date-vs-datetime comparisons")
+
 	# --- joins ------------------------------------------------------------------------------------------------------------
 	def test_joins(self):
 		p, k = T, K

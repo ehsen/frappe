@@ -156,3 +156,29 @@ def like_regex(pattern: str, escape: str = "\\") -> str:
 		i += 1
 	parts.append("$")
 	return "".join(parts)
+
+
+@lru_cache(maxsize=1)
+def empty_pattern() -> str:
+	"""Regex (for `string::matches`) that matches exactly the strings MariaDB compares equal to `''`.
+
+	Long-text columns have no collation shadow, but the one comparison Frappe makes on them all the time - `col = ''` /
+	`col <> ''` ("is not set" / "is set") - needs none: a string equals `''` under PAD SPACE when every character weighs
+	nothing (ignorable: control characters, zero-width characters) or only the space weight (U+0020, U+00A0, U+2000..)."""
+	cps = sorted(
+		cp
+		for cp, w in _explicit().items()
+		if not w or all(w[i : i + 4] == SPACE_WEIGHT for i in range(0, len(w), 4))
+	)
+	ranges: list[list[int]] = []
+	for cp in cps:
+		if ranges and cp == ranges[-1][1] + 1:
+			ranges[-1][1] = cp
+		else:
+			ranges.append([cp, cp])
+	body = "".join(f"\\x{{{a:X}}}" if a == b else f"\\x{{{a:X}}}-\\x{{{b:X}}}" for a, b in ranges)
+	return f"^[{body}]*$"
+
+
+def equals_empty(value: str) -> bool:
+	return ci_key(value) == ci_key("")

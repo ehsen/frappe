@@ -58,6 +58,13 @@ FLIPPED = {"=": "=", "!=": "!=", ">": "<", ">=": "<=", "<": ">", "<=": ">="}
 INT_KINDS = ("int", "tinyint", "smallint", "bigint")
 NUMERIC_KINDS = frozenset((*INT_KINDS, "decimal"))
 TEMPORAL_KINDS = ("date", "datetime", "time")
+EMPTY_STRING_AS = {
+	**dict.fromkeys(INT_KINDS, 0),
+	"decimal": 0,
+	"date": "0000-00-00",
+	"datetime": "0000-00-00 00:00:00.000000",
+	"time": 0,
+}
 _NOTHING = object()
 P1_6C = "P1.6c"
 
@@ -544,6 +551,15 @@ class Renderer:
 			and args[1].is_const
 			and args[1].const == ""
 			and not first.is_const
+			and first.kind in ("text", "json")
+		):
+			# stays a long-text value; only its emptiness can be tested (`_compare`)
+			return Expr(f"({first.sql} ?? {self.params.add('')})", first.spec)
+		if (
+			len(args) == 2
+			and args[1].is_const
+			and args[1].const == ""
+			and not first.is_const
 			and self._family(first) in ("num", *TEMPORAL_KINDS)
 		):
 			# `IFNULL(number_or_date, '')`: MariaDB makes it a string; the only thing Frappe does with it is `= ''` ("is not set"),
@@ -778,6 +794,20 @@ class Renderer:
 		start, end = {"year": (0, 4), "month": (5, 7), "day": (8, 10)}[unit]
 		return self._part([x], start, end, f"EXTRACT({unit})")
 
+	def _fn_monthname(self, args, term):
+		(x,) = args
+		x = self._temporal(x, "MONTHNAME()")
+		return Expr(
+			self._null_safe([x], f"time::format({self._as_datetime(x)}, '%B')"), _synthetic("varchar")
+		)
+
+	def _fn_dayname(self, args, term):
+		(x,) = args
+		x = self._temporal(x, "DAYNAME()")
+		return Expr(
+			self._null_safe([x], f"time::format({self._as_datetime(x)}, '%A')"), _synthetic("varchar")
+		)
+
 	_DATE_FORMATS: ClassVar[dict[str, str]] = {
 		"Y": "%Y", "y": "%y", "m": "%m", "c": "%-m", "d": "%d", "e": "%-d", "H": "%H", "k": "%-H", "h": "%I", "I": "%I",
 		"l": "%-I", "i": "%M", "s": "%S", "S": "%S", "f": "%6f", "T": "%H:%M:%S", "M": "%B", "b": "%b", "W": "%A",
@@ -824,11 +854,24 @@ class Renderer:
 			if e.opaque_string and value != "":
 				unsupported("comparing IFNULL(non-string, '') with anything but ''", P1_6C)
 			return e.ci, self.params.add(collation.ci_key(values.to_str(value)))
+		if isinstance(value, str) and not value.strip() and spec.kind in EMPTY_STRING_AS:
+			# MariaDB converts '' to the zero of the other operand's type (`date <> ''` is Frappe's "is set" for a Date field)
+			return e.sql, self.params.add(EMPTY_STRING_AS[spec.kind])
 		if spec.kind in INT_KINDS or spec.kind == "decimal":
 			return e.sql, self.params.add(self._number(spec, value))
 		if spec.kind in ("date", "datetime", "time", "uuid"):
-			if spec.kind == "date" and isinstance(value, str) and re.search(r"[ T]\d{1,2}:\d", value):
-				unsupported("comparing a date column with a datetime literal", "P1.6")
+			if (
+				spec.kind == "date"
+				and isinstance(value, str | dt.datetime)
+				and (isinstance(value, dt.datetime) or re.search(r"[ T]\d{1,2}:\d", value))
+			):
+				# MariaDB compares a DATE with a datetime literal as a DATETIME: the date at midnight
+				try:
+					encoded = encode_for_kind(_synthetic("datetime"), value)
+				except values.ValueError_ as e_:
+					unsupported(f"an invalid datetime literal ({e_})", "P1.6")
+				midnight = f"IF {_absent(e.sql)[1:-1]} THEN NULL ELSE ({e.sql} + ' 00:00:00.000000') END"
+				return f"({midnight})", self.params.add(encoded)
 			try:
 				encoded = encode_for_kind(
 					spec, value.lower() if spec.kind == "uuid" and isinstance(value, str) else value
@@ -907,6 +950,17 @@ class Renderer:
 		if right.is_const:
 			if right.const is None:
 				return "false"  # `col = NULL` is UNKNOWN in MariaDB: never true, and neither is its negation
+			if (
+				left.spec is not None
+				and left.spec.kind in ("text", "json")
+				and isinstance(right.const, str)
+				and op in ("=", "!=")
+				and collation.equals_empty(right.const)
+			):
+				# "is set" / "is not set" on long text: exact without a shadow (see collation.empty_pattern)
+				matches = f"string::matches({left.sql}, {self.params.add(collation.empty_pattern())})"
+				present = self._guard(left.sql)
+				return f"({present} AND {matches})" if op == "=" else f"({present} AND NOT ({matches}))"
 			stored, operand = self._operand(left, right.const)
 			core = f"{stored} {op} {operand}"
 			if op == "=":
@@ -1250,8 +1304,10 @@ class Renderer:
 	# * COUNT(col) counts non-NULL values (`count(col != NULL AND col != NONE)`), COUNT(*) is `count()`.
 	def grouped_select(self, q, source: str, where: str | None, hints: bool) -> str:
 		group_terms = list(q._groupbys)
-		if q._distinct and not group_terms:
-			group_terms = list(q._selects)
+		if q._distinct and not group_terms and not any(self._has_aggregate(t) for t in q._selects):
+			group_terms = list(
+				q._selects
+			)  # SELECT DISTINCT a, b == GROUP BY a, b (an aggregate row is one row anyway)
 		g = Grouping(self)
 		for term in group_terms:
 			g.add_key(term)

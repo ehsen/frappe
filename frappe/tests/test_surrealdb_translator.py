@@ -220,7 +220,6 @@ class TestSurrealDBTranslator(UnitTestCase):
 			"long text compare": q().select(T.name).where(T.notes == "x"),
 			"string vs number": q().select(T.name).where(T.title == 5),
 			"number vs bad string": q().select(T.name).where(T.qty == "abc"),
-			"date vs datetime literal": q().select(T.name).where(T.day == "2024-01-05 10:00:00"),
 			"regex": q().select(T.name).where(T.title.regex("a")),
 			"for update": q().select(T.name).for_update(),
 			"order by long text": q().select(T.name).orderby(T.notes),
