@@ -1,0 +1,98 @@
+from unittest.mock import patch
+
+import frappe
+from frappe.database import bootstrap_database, get_command, get_db
+from frappe.database.surrealdb.database import SurrealDBDatabase
+from frappe.database.surrealdb.errors import SurrealDBNotImplementedError
+from frappe.query_builder.surrealdb_builder import SurrealDB
+from frappe.query_builder.utils import db_type_is, get_query_builder
+from frappe.tests import UnitTestCase
+
+
+def _conf(db_type):
+	return patch.dict(frappe.local.conf, {"db_type": db_type})
+
+
+class TestSurrealDBDispatch(UnitTestCase):
+	"""P1.1: the surrealdb dispatch is explicit, and never falls through into another engine."""
+
+	def test_get_db_returns_surrealdb_database(self):
+		with _conf("surrealdb"):
+			db = get_db(cur_db_name="scratch")
+		self.assertIsInstance(db, SurrealDBDatabase)
+		self.assertEqual(db.db_type, "surrealdb")
+		self.assertEqual(db.default_port, 8000)
+
+	def test_other_engines_still_route_to_their_own_backend(self):
+		with _conf("mariadb"), patch.dict(frappe.local.conf, {"use_mysqlclient": 1}):
+			self.assertEqual(type(get_db(cur_db_name="x")).__module__, "frappe.database.mariadb.mysqlclient")
+		with _conf("mariadb"), patch.dict(frappe.local.conf, {"use_mysqlclient": 0}):
+			self.assertEqual(type(get_db(cur_db_name="x")).__module__, "frappe.database.mariadb.database")
+		with _conf("sqlite"):
+			self.assertEqual(type(get_db(cur_db_name="x")).__module__, "frappe.database.sqlite.database")
+
+	def test_unimplemented_backend_paths_fail_closed(self):
+		with _conf("surrealdb"):
+			db = get_db(cur_db_name="scratch")
+			for call in (
+				lambda: db.get_database_size(),
+				lambda: db.escape("x"),
+				lambda: db.get_on_duplicate_update(),
+				lambda: bootstrap_database(),
+				lambda: get_command(),
+			):
+				with self.assertRaises(SurrealDBNotImplementedError):
+					call()
+
+	def test_error_names_the_owning_chunk_and_is_not_implemented_error(self):
+		with _conf("surrealdb"), self.assertRaises(NotImplementedError) as cm:
+			get_db(cur_db_name="scratch").get_database_size()
+		self.assertIn("P4.5", str(cm.exception))
+		self.assertIn("does not fall back", str(cm.exception))
+
+	def test_unclassified_errors_are_not_mistaken_for_mariadb_errors(self):
+		with _conf("surrealdb"):
+			db = get_db(cur_db_name="scratch")
+		e = Exception("Duplicate entry 'x' for key 'PRIMARY'")
+		self.assertFalse(db.is_duplicate_entry(e))
+		self.assertFalse(db.is_deadlocked(e))
+
+	def test_query_builder_is_registered_and_accepts_the_lock_signature(self):
+		self.assertIs(get_query_builder("surrealdb"), SurrealDB)
+		self.assertIs(db_type_is("surrealdb"), db_type_is.SURREALDB)
+		# P1.8: `for_update` accepts the MySQL-dialect signature that `frappe.database.query` calls it
+		# with and stores the flags where the translator reads them (rendered shapes are golden-tested
+		# in the translator suite, which injects its own schema loader - rendering needs a live db here)
+		q = SurrealDB.from_("tabToDo").select("name").for_update(nowait=True)
+		self.assertTrue(q._for_update)
+		self.assertTrue(q._for_update_nowait)
+		self.assertFalse(q._for_update_skip_locked)
+		self.assertFalse(SurrealDB.from_("tabToDo").select("name")._for_update)
+
+	def test_query_functions_without_a_surrealdb_mapping_fail_closed(self):
+		from frappe.query_builder.functions import Locate, Match
+
+		for function in (Locate, Match):
+			with _conf("surrealdb"), self.assertRaises(SurrealDBNotImplementedError):
+				function("name", "x")
+
+	def test_query_functions_the_translator_renders_are_mapped(self):
+		from frappe.query_builder.custom import GROUP_CONCAT
+		from frappe.query_builder.functions import CombineDatetime, DateFormat, GroupConcat, UnixTimestamp
+
+		with _conf("surrealdb"):
+			self.assertIsInstance(GroupConcat("name"), GROUP_CONCAT)
+			for term in (
+				CombineDatetime("posting_date", "posting_time"),
+				DateFormat("creation", "%Y"),
+				UnixTimestamp("creation"),
+			):
+				self.assertTrue(hasattr(term, "args"))
+
+	def test_default_port_and_health_probe_do_not_use_another_engines_port(self):
+		from frappe.utils import connections
+
+		with patch.object(connections, "get_conf", return_value=frappe._dict(db_type="surrealdb")):
+			with patch.object(connections, "is_open", return_value=True) as is_open:
+				self.assertEqual(connections.check_database(), {"surrealdb": True})
+		is_open.assert_called_once_with("surrealdb", "127.0.0.1", 8000, None)
