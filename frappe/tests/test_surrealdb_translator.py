@@ -154,7 +154,9 @@ class TestSurrealDBTranslator(UnitTestCase):
 			.columns("name", "title", "qty", "amount", "day")
 			.insert("Doc-1", "Été", 3, None, "2024-1-5")
 		)
-		self.assertEqual(sql, "INSERT INTO `tabDoc` $param1 RETURN NONE")
+		# `INSERT INTO` always carries the `/*uq:*/` hint: the driver pre-checks the table's unique
+		# indexes against the rows (P1.8) before it writes
+		self.assertEqual(sql, "INSERT INTO `tabDoc` $param1 /*uq:tabDoc:param1*/ RETURN NONE")
 		(row,) = params.values["param1"]
 		self.assertEqual(row["id"], "doc-1")
 		self.assertEqual(
@@ -163,6 +165,46 @@ class TestSurrealDBTranslator(UnitTestCase):
 		)
 		self.assertEqual((row["qty"], row["amount"], row["day"]), (3, None, "2024-01-05"))
 		self.assertEqual(row["title@like"], C.like_shadow("Été"))
+
+	def test_for_update_renders_lock_hints(self):
+		# key mode: a `name = <literal>` conjunct locks that one record before the read (single statement)
+		sql, params = r(q().select(T.name).where(T.name == "Doc-1").for_update())
+		self.assertEqual(
+			sql,
+			"SELECT `name`, id AS `__lk0` FROM `tabDoc` WHERE (`name@ci` = $param1) "
+			"/*cols:name*/ /*kinds:varchar*/ /*lock:l:k:tabDoc:doc-1*/",
+		)
+		self.assertEqual(params.values["param1"], C.ci_key("Doc-1"))
+		sql, _ = r(q().select(T.name).where(T.name == "Doc-1").for_update(nowait=True))
+		self.assertTrue(sql.endswith("/*lock:n:k:tabDoc:doc-1*/"), sql)
+
+		# general mode: a two-statement script - candidate ids first, then the same select
+		sql, params = r(q().select(T.name, T.title).where(T.qty > 2).orderby(T.qty).limit(5).for_update())
+		self.assertEqual(
+			sql,
+			"SELECT id AS `__lk0`, `qty` AS `__o0` FROM `tabDoc` "
+			"WHERE (`qty` != NULL AND `qty` != NONE AND `qty` > $param1) ORDER BY `__o0` ASC LIMIT 5; "
+			"SELECT `name`, `title`, `qty` AS `__o0`, id AS `__lk0` FROM `tabDoc` "
+			"WHERE (`qty` != NULL AND `qty` != NONE AND `qty` > $param1) ORDER BY `__o0` ASC LIMIT 5 "
+			"/*cols:name,title*/ /*kinds:varchar,varchar*/ /*lock:l:t:tabDoc:5*/",
+		)
+		self.assertEqual(params.values, {"param1": 2})
+		sql, _ = r(q().select(T.name).where(T.qty > 2).limit(3).offset(6).for_update(nowait=True))
+		self.assertIn("LIMIT 3 START 6", sql)
+		self.assertTrue(sql.endswith("/*lock:n:t:tabDoc:3*/"), sql)
+
+		# SKIP LOCKED: the ids statement runs unpaginated, the main select too (the cursor claims the
+		# first `LIMIT` unlocked rows itself; documented deviation from MariaDB's limit-fill)
+		sql, _ = r(q().select(T.name).where(T.qty > 2).limit(5).for_update(skip_locked=True))
+		self.assertEqual(
+			sql,
+			"SELECT id AS `__lk0` FROM `tabDoc` WHERE (`qty` != NULL AND `qty` != NONE AND `qty` > $param1); "
+			"SELECT `name`, id AS `__lk0` FROM `tabDoc` WHERE (`qty` != NULL AND `qty` != NONE AND `qty` > $param1) "
+			"/*cols:name*/ /*kinds:varchar*/ /*lock:s:t:tabDoc:5*/",
+		)
+		sql, _ = r(q().select(T.name).where(T.qty > 2).for_update(skip_locked=True))
+		self.assertTrue(sql.endswith("/*lock:s:t:tabDoc:*/"), sql)
+		self.assertNotIn("LIMIT", sql)
 
 		sql, params = r(
 			SurrealDB.update(T).set(T.title, "New").set(T.qty, T.qty + 1).where(T.name == "Doc-1")
@@ -178,6 +220,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertEqual(sql, "DELETE `tabDoc` WHERE (`qty` = $param1) RETURN NONE")
 		sql, _ = r(SurrealDB.into(T).columns("name").insert("x").ignore())
 		self.assertTrue(sql.startswith("INSERT IGNORE INTO"))
+		self.assertNotIn("/*uq:", sql)  # INSERT IGNORE skips rows that already exist on its own
 
 	def test_errors_match_what_mariadb_says(self):
 		with self.assertRaises(SurrealDBProgrammingError) as cm:
@@ -221,7 +264,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 			"string vs number": q().select(T.name).where(T.title == 5),
 			"number vs bad string": q().select(T.name).where(T.qty == "abc"),
 			"regex": q().select(T.name).where(T.title.regex("a")),
-			"for update": q().select(T.name).for_update(),
+			"for update with group by": q().select(fn.Count("*")).groupby(T.flag).for_update(),
 			"order by long text": q().select(T.name).orderby(T.notes),
 			"rename via update": SurrealDB.update(T).set(T.name, "x"),
 			"insert expression": SurrealDB.into(T).columns("name", "title").insert("x", T.title),

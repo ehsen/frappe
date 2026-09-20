@@ -4,6 +4,7 @@
 import functools
 import logging
 import os
+from itertools import count
 
 import orjson
 from werkzeug.exceptions import HTTPException, NotFound
@@ -140,51 +141,16 @@ def application(request: Request):
 
 		validate_auth()
 
-		if request.method == "OPTIONS":
-			response = Response()
-
-		elif frappe.form_dict.cmd:
-			from frappe.deprecation_dumpster import deprecation_warning
-
-			deprecation_warning(
-				"unknown",
-				"v17",
-				f"{frappe.form_dict.cmd}: Sending `cmd` for RPC calls is deprecated, call REST API instead `/api/method/cmd`",
-			)
-			frappe.handler.handle()
-			response = frappe.utils.response.build_response("json")
-
-		elif request.path.startswith("/api/"):
-			response = frappe.api.handle(request)
-
-		elif request.path.startswith("/backups"):
-			response = frappe.utils.response.download_backup(request.path)
-
-		elif request.path.startswith("/private/files/"):
-			response = frappe.utils.response.download_private_file(request.path)
-
-		elif request.path == "/.well-known/security.txt" and request.method == "GET":
-			if request.scheme != "https":
-				raise NotFound
-			security_settings = frappe.get_doc("Security Settings")
-			response = Response(security_settings.security_txt, content_type="text/plain")
-
-		elif request.path.startswith("/.well-known/") and request.method == "GET":
-			response = handle_wellknown(request.path)
-
-		elif request.method in ("GET", "HEAD", "POST"):
-			response = get_response()
-
-		else:
-			raise NotFound
+		response = _dispatch(request)
 
 	except Exception as e:
-		response = e.get_response(request.environ) if isinstance(e, HTTPException) else handle_exception(e)
+		response = _exception_response(e, request.environ)
 		if db := getattr(frappe.local, "db", None):
 			db.rollback(chain=True)
 
 	else:
-		sync_database()
+		if (retried := _sync_and_retry(request)) is not None:
+			response = retried
 
 	finally:
 		# Important note:
@@ -470,6 +436,86 @@ def sync_database():
 	# update session
 	if session := getattr(frappe.local, "session_obj", None):
 		frappe.request.after_response.add(session.update)
+
+
+def _dispatch(request: Request):
+	"""The request dispatch of `application`: the branch on method/path that builds the response."""
+	if request.method == "OPTIONS":
+		return Response()
+
+	elif frappe.form_dict.cmd:
+		from frappe.deprecation_dumpster import deprecation_warning
+
+		deprecation_warning(
+			"unknown",
+			"v17",
+			f"{frappe.form_dict.cmd}: Sending `cmd` for RPC calls is deprecated, call REST API instead `/api/method/cmd`",
+		)
+		frappe.handler.handle()
+		return frappe.utils.response.build_response("json")
+
+	elif request.path.startswith("/api/"):
+		return frappe.api.handle(request)
+
+	elif request.path.startswith("/backups"):
+		return frappe.utils.response.download_backup(request.path)
+
+	elif request.path.startswith("/private/files/"):
+		return frappe.utils.response.download_private_file(request.path)
+
+	elif request.path == "/.well-known/security.txt" and request.method == "GET":
+		if request.scheme != "https":
+			raise NotFound
+		security_settings = frappe.get_doc("Security Settings")
+		return Response(security_settings.security_txt, content_type="text/plain")
+
+	elif request.path.startswith("/.well-known/") and request.method == "GET":
+		return handle_wellknown(request.path)
+
+	elif request.method in ("GET", "HEAD", "POST"):
+		return get_response()
+
+	else:
+		raise NotFound
+
+
+def _exception_response(e: Exception, environ) -> Response:
+	"""What `application`'s except branch does with an exception: the HTTP error response if it is one,
+	else the handled response."""
+	return e.get_response(environ) if isinstance(e, HTTPException) else handle_exception(e)
+
+
+def _sync_and_retry(request: Request):
+	"""End-of-request commit/rollback with the unit-of-work retry of ADR 0002 (SurrealDB only).
+
+	A retryable commit conflict rolls the unit back and re-runs the whole request with fresh data,
+	bounded times; returns the re-dispatched response, or None when nothing was retried (the caller
+	keeps its own). Every other engine keeps the historical control flow: `sync_database()` raises out
+	of `application`'s else branch exactly as before - the retry hook refuses non-surrealdb
+	connections, so the exception propagates untouched."""
+	from frappe.database.surrealdb.transactions import retry_request_commit
+
+	response = None  # the re-dispatched response; attempt 0's lives in the caller
+
+	for attempt in count():
+		try:
+			sync_database()
+			# attempt 0 is the original dispatch: `application` already holds its response. On a retry
+			# the re-dispatched unit's response (from the loop below) replaces it.
+			return response if attempt > 0 else None
+		except Exception as e:
+			if not retry_request_commit(e, attempt):
+				raise
+		try:
+			response = _dispatch(request)
+		except Exception as e:
+			# a failed re-dispatch is handled exactly like a failed dispatch: build its response, roll
+			# the unit back - but no `sync_database()` afterwards, like the except branch of `application`
+			response = _exception_response(e, request.environ)
+			if db := getattr(frappe.local, "db", None):
+				db.rollback(chain=True)
+			return response
+		# the re-dispatched unit gets its own `sync_database()` on the next iteration
 
 
 # Always initialize sentry SDK if the DSN is sent

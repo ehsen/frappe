@@ -1209,9 +1209,12 @@ class Renderer:
 			return _is_aggregate(term)
 
 	def select(self, q, hints: bool = True) -> str:
-		self._reject(q, "_union", "_for_update", "_with", "_prewheres")
+		self._reject(q, "_union", "_with", "_prewheres")
 		source, where = self._from_and_where(q)
+		mode = self._for_update_mode(q)
 		if q._groupbys or q._distinct or q._havings or any(self._has_aggregate(t) for t in q._selects):
+			if mode is not None:
+				unsupported("FOR UPDATE with GROUP BY / DISTINCT / HAVING / aggregates", "P1.8")
 			return self.grouped_select(q, source, where, hints)
 		columns = self._projection(q._selects, hints)
 		hidden = []
@@ -1221,17 +1224,87 @@ class Renderer:
 			ordering.append(f"`__o{len(ordering)}` {direction}")
 			hidden.append(f"{expr} AS `__o{len(hidden)}`")
 		projection = [c["sql"] for c in columns] + hidden
+		key = None
+		if mode is not None:
+			if self.shared.prelude:
+				unsupported("FOR UPDATE with sub-queries", "P1.8")
+			key = self._lock_key(q)
+			projection.append("id AS `__lk0`")  # each row's id: the lock key and the SKIP LOCKED filter
 		parts = [f"SELECT {', '.join(projection)} FROM {source}"]
 		if where is not None:
 			parts.append(f"WHERE {where}")
 		if ordering:
 			parts.append("ORDER BY " + ", ".join(ordering))
-		return self._finish(parts, q, columns, hints)
+		if mode is None:
+			return self._finish(parts, q, columns, hints)
+		if key is not None:
+			# `name = <literal>` in the WHERE: lock that record before the read (get_value's shape)
+			return self._finish(parts, q, columns, hints) + f" /*lock:{mode}:k:{self.ctxs[0].schema.name}:{key}*/"
+		return self._for_update_script(q, mode, source, where, ordering, hidden, parts, columns, hints)
 
-	def _finish(self, parts: list, q, columns: list, hints: bool) -> str:
-		if q._limit is not None:
+	# --- FOR UPDATE (P1.8: application locks and fences, ADR 0002) ----------------------------------------------
+	def _for_update_mode(self, q) -> str | None:
+		"""None, or `l` (blocking) / `n` (NOWAIT) / `s` (SKIP LOCKED) when the query is a `for_update` read."""
+		if not _attr(q, "_for_update", False):
+			return None
+		if _attr(q, "_for_update_of", None):
+			unsupported("FOR UPDATE OF ...", "P1.8")
+		if _attr(q, "_for_update_nowait", False):
+			return "n"
+		if _attr(q, "_for_update_skip_locked", False):
+			return "s"
+		return "l"
+
+	def _lock_key(self, q) -> str | None:
+		"""A `name = <literal>` conjunct in the WHERE: the record id whose lock stands for the row, so the
+		lock is granted *before* the read and the read sees the previous holder's commit (P0.4 a1)."""
+		if q._wheres is None:
+			return None
+		schema = self.ctxs[0].schema
+		for term in self._conjuncts(q._wheres):
+			if _kind(term) != "BasicCriterion" or _sql_word(term.comparator) != "=":
+				continue
+			left = term.left
+			if _kind(left) != "Field" or left.name != "name" or (
+				left.table is not None and not self._same_table(left.table, self.ctxs[0].table)
+			):
+				continue
+			is_literal, value = self._literal(term.right)
+			if is_literal:
+				return self._record_key(schema, value)
+		return None
+
+	def _for_update_script(self, q, mode: str, source: str, where, ordering: list, hidden: list, parts, columns, hints: bool) -> str:
+		"""FOR UPDATE as a two-statement script (P1.8, ADR 0002): first the ids to lock, then the query.
+		The cursor grants the application locks (`__lock` CAS plus a `__fence` write) between the two and
+		re-runs the script, so the caller reads the locked rows' fresh state. SKIP LOCKED (`s`) claims only
+		unlocked rows and drops the rest of the result instead."""
+		schema = self.ctxs[0].schema
+		limit = int(q._limit) if q._limit is not None else None
+		ids = ["SELECT " + ", ".join(["id AS `__lk0`", *hidden]) + f" FROM {source}"]
+		if where is not None:
+			ids.append(f"WHERE {where}")
+		if ordering:
+			ids.append("ORDER BY " + ", ".join(ordering))
+		if mode != "s":
+			# block on exactly the rows the query returns
+			if limit is not None:
+				ids.append(f"LIMIT {limit}")
+			if q._offset:
+				ids.append(f"START {int(q._offset)}")
+			main = self._finish(parts, q, columns, hints)
+		else:
+			# candidates come without LIMIT (the cursor claims the first `limit` unlocked ones in query
+			# order), and the main select runs without LIMIT/START so its rows can be filtered down to
+			# the claimed ids
+			main = self._finish(parts, q, columns, hints, page=False)
+		script = "; ".join([" ".join(ids), main])
+		return script + f" /*lock:{mode}:t:{schema.name}:{'' if limit is None else limit}*/"
+
+	def _finish(self, parts: list, q, columns: list, hints: bool, page: bool = True) -> str:
+		if page and q._limit is not None:
 			parts.append(f"LIMIT {int(q._limit)}")
-		if q._offset:
+		if page and q._offset:
 			parts.append(f"START {int(q._offset)}")
 		self.result_specs = [c["spec"] for c in columns]
 		text = " ".join(parts)
@@ -1440,7 +1513,12 @@ class Renderer:
 		if duplicates and _attr(q, "_ignore", False):
 			unsupported("INSERT IGNORE ... ON DUPLICATE KEY UPDATE", "P1.6")
 		verb = "INSERT IGNORE INTO" if _attr(q, "_ignore", False) else "INSERT INTO"
-		text = f"{verb} {quote_table(schema.name)} {self.params.add(rows)}"
+		placeholder = self.params.add(rows)
+		text = f"{verb} {quote_table(schema.name)} {placeholder}"
+		if verb == "INSERT INTO" and not duplicates:
+			# the driver pre-checks the table's unique indexes against these rows before writing (P1.8);
+			# INSERT IGNORE and ON DUPLICATE KEY UPDATE have their own duplicate handling
+			text += f" /*uq:{schema.name}:{placeholder[1:]}*/"
 		if duplicates:
 			text += " ON DUPLICATE KEY UPDATE " + ", ".join(self._duplicate_assignments(schema, duplicates))
 		return text + " RETURN NONE"

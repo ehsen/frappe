@@ -206,9 +206,12 @@ class TestSurrealDBDriver(UnitTestCase):
 		self.assertTrue(all(c[3] == "txn-1" for c in queries(server)))
 		db.commit()  # Database.commit = `commit` then `START TRANSACTION`
 		self.assertIn(("commit", "txn-1"), server.calls)
-		self.assertIn(("begin",), server.calls[server.calls.index(("commit", "txn-1")) :])
+		# MariaDB: START TRANSACTION takes no snapshot - the transaction opens with the first real
+		# statement, so the unit started by the trailing begin() reads fresh data (P1.8 live finding)
+		self.assertNotIn(("begin",), server.calls[server.calls.index(("commit", "txn-1")) :])
 		db.sql("SELECT 3")
 		self.assertEqual(queries(server)[-1][3], "txn-2")
+		self.assertEqual([c for c in server.calls if c[0] == "begin"], [("begin",), ("begin",)])
 
 	def test_rollback_cancels(self):
 		server = FakeServer()
@@ -217,7 +220,7 @@ class TestSurrealDBDriver(UnitTestCase):
 		db.rollback()
 		self.assertIn(("cancel", "txn-1"), server.calls)
 
-	def test_failed_statement_taints_the_transaction(self):
+	def test_failed_first_statement_does_not_taint_the_unit(self):
 		state = {"fail": True}
 
 		def responder(q, p, t):
@@ -228,18 +231,39 @@ class TestSurrealDBDriver(UnitTestCase):
 		server = FakeServer(responder)
 		db = make_db(server)
 		with self.assertRaises(E.SurrealDBIntegrityError):
-			db.sql("CREATE t:a SET name = 'a'")
+			db.sql("CREATE t:a SET name = 'a'")  # failed before writing anything (P1.8: no replay needed)
 		state["fail"] = False
 		db.sql("SELECT 1")  # the transaction is still usable...
-		with self.assertRaises(E.SurrealDBTransactionTainted):  # ...but it must not commit
-			db.commit()
-		self.assertFalse(
-			any(c[0] == "commit" for c in server.calls), "the failed write must never be committed"
-		)
-		db.rollback()  # rollback clears the taint
-		db.sql("SELECT 2")
-		db.commit()
+		db.commit()  # ...and commits: the failed statement wrote nothing
 		self.assertTrue(any(c[0] == "commit" for c in server.calls))
+
+	def test_failed_post_write_statement_is_replayed_without_the_ghost_row(self):
+		state = {"fail": True}
+
+		def responder(q, p, t):
+			if state["fail"] and "CREATE t:b" in q:
+				return {
+					"result": [
+						{"status": "ERR", "result": "Database index `uq` already contains 'b', with record `t:b`"}
+					]
+				}
+			return ok([])
+
+		server = FakeServer(responder)
+		db = make_db(server)
+		db.sql("CREATE t:a SET name = 'a'")  # logged
+		with self.assertRaises(E.SurrealDBIntegrityError):
+			db.sql("CREATE t:b SET name = 'b'")  # wrote a ghost row, then failed -> replay drops it
+		state["fail"] = False
+		db.sql("SELECT 1")  # the transaction is still usable...
+		db.commit()  # ...and commits
+		self.assertTrue(any(c[0] == "commit" for c in server.calls))
+		# the unit was replayed on a fresh transaction: prior writes survive, the failed statement
+		# is dropped and was attempted exactly once
+		self.assertIn(("cancel", "txn-1"), server.calls)
+		txn2 = [c for c in queries(server) if c[3] == "txn-2"]
+		self.assertEqual([c[1] for c in txn2 if "CREATE" in c[1]], ["CREATE t:a SET name = 'a'"])
+		self.assertEqual(len([c for c in queries(server) if "CREATE t:b" in c[1]]), 1)
 
 	def test_commit_conflict_becomes_query_deadlock_error(self):
 		server = FakeServer()
@@ -281,11 +305,47 @@ class TestSurrealDBDriver(UnitTestCase):
 			db.sql("SELECT 2")
 		self.assertEqual(server.clients, 1)
 
-	def test_savepoints_fail_closed_until_p1_8(self):
-		db = make_db(FakeServer())
-		with self.assertRaises(E.SurrealDBNotImplementedError) as cm:
-			db.savepoint("sp1")
-		self.assertIn("P1.8", str(cm.exception))
+	def test_savepoint_rolls_the_log_back_to_the_mark(self):
+		server = FakeServer()
+		db = make_db(server)
+		db.sql("CREATE t:a SET name = 'a'")
+		db.savepoint("sp1")  # driver-emulated: a log mark, no server round-trip
+		db.sql("CREATE t:b SET name = 'b'")
+		db.rollback(save_point="sp1")  # -> `rollback to savepoint sp1`
+		db.commit()
+		# replayed on a fresh transaction: writes before the mark survive, writes after it are gone
+		self.assertIn(("cancel", "txn-1"), server.calls)
+		txn2 = [c[1] for c in queries(server) if c[3] == "txn-2"]
+		self.assertEqual([s for s in txn2 if "CREATE" in s], ["CREATE t:a SET name = 'a'"])
+		self.assertIn(("commit", "txn-2"), server.calls)
+
+	def test_savepoints_nest_and_rollback_to_releases_later_marks(self):
+		server = FakeServer()
+		db = make_db(server)
+		db.sql("CREATE t:a SET name = 'a'")
+		db.savepoint("sp1")
+		db.sql("CREATE t:b SET name = 'b'")
+		db.savepoint("sp2")
+		db.sql("CREATE t:c SET name = 'c'")
+		db.rollback(save_point="sp1")  # MariaDB: ROLLBACK TO releases savepoints taken after it
+		with self.assertRaises(E.SurrealDBProgrammingError) as cm:
+			db.rollback(save_point="sp2")
+		self.assertEqual(cm.exception.args, (1305, "SAVEPOINT sp2 does not exist"))
+		db.commit()
+		txn2 = [c[1] for c in queries(server) if c[3] == "txn-2"]
+		self.assertEqual([s for s in txn2 if "CREATE" in s], ["CREATE t:a SET name = 'a'"])
+
+	def test_release_savepoint_keeps_the_writes_but_drops_the_mark(self):
+		server = FakeServer()
+		db = make_db(server)
+		db.savepoint("sp1")
+		db.release_savepoint("sp1")
+		with self.assertRaises(E.SurrealDBProgrammingError) as cm:
+			db.rollback(save_point="sp1")
+		self.assertEqual(cm.exception.args[0], 1305)
+		db.sql("CREATE t:a SET name = 'a'")
+		db.commit()
+		self.assertTrue(any(c[0] == "commit" for c in server.calls))
 
 	def test_signin_failure_is_classified(self):
 		class BadClient(FakeClient):

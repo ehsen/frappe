@@ -57,11 +57,17 @@ class TestSurrealDBDispatch(UnitTestCase):
 		self.assertFalse(db.is_duplicate_entry(e))
 		self.assertFalse(db.is_deadlocked(e))
 
-	def test_query_builder_is_registered_and_fails_closed(self):
+	def test_query_builder_is_registered_and_accepts_the_lock_signature(self):
 		self.assertIs(get_query_builder("surrealdb"), SurrealDB)
 		self.assertIs(db_type_is("surrealdb"), db_type_is.SURREALDB)
-		with self.assertRaises(SurrealDBNotImplementedError):
-			SurrealDB.from_("ToDo").select("name").for_update().get_sql()
+		# P1.8: `for_update` accepts the MySQL-dialect signature that `frappe.database.query` calls it
+		# with and stores the flags where the translator reads them (rendered shapes are golden-tested
+		# in the translator suite, which injects its own schema loader - rendering needs a live db here)
+		q = SurrealDB.from_("tabToDo").select("name").for_update(nowait=True)
+		self.assertTrue(q._for_update)
+		self.assertTrue(q._for_update_nowait)
+		self.assertFalse(q._for_update_skip_locked)
+		self.assertFalse(SurrealDB.from_("tabToDo").select("name")._for_update)
 
 	def test_query_functions_without_a_surrealdb_mapping_fail_closed(self):
 		from frappe.query_builder.functions import Locate, Match

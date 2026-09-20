@@ -31,6 +31,17 @@ class SurrealDBQueryBuilder(QueryBuilder):
 		self._ignore = True
 
 	@builder
+	def for_update(self, nowait: bool = False, skip_locked: bool = False, of=()):
+		"""PyPika's MySQL dialect signature (frappe's fork of pypika), because `frappe.database.query`
+		calls `for_update(skip_locked=..., nowait=...)` with these keyword arguments. The base builder
+		only has the no-argument variant. The translator reads the stored flags (`P1.8`): the flags land
+		in the same attributes the fork's MySQL builder uses, so `_for_update_mode` is engine-agnostic."""
+		self._for_update = True
+		self._for_update_skip_locked = skip_locked
+		self._for_update_nowait = nowait
+		self._for_update_of = set(of)
+
+	@builder
 	def on_duplicate_key_update(self, field, value):
 		"""`INSERT .. ON DUPLICATE KEY UPDATE field = value` (same call as PyPika's MySQL builder; `Values(field)` allowed)."""
 		self._duplicate_updates.append(

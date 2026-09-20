@@ -1,17 +1,25 @@
-"""Driver boundary of the SurrealDB backend (chunk P1.3).
+"""Driver boundary of the SurrealDB backend (chunks P1.3, P1.8).
 
 Rules fixed by measurement (docs/ENVIRONMENT.md "Driver findings", `spike/P1.3-driver/error_kinds.py`):
 
 * WebSocket transport only; every call goes through `query_raw` and the status of **every** statement in the
   response is checked in Python (the SDK's `query()` inspects only the first one). No extra round trip.
-* Frappe expects an autocommit-off connection (one request = one transaction). `SurrealConnection` therefore opens
-  an interactive transaction lazily on the first statement and ends it on `commit`/`rollback`.
-* SurrealDB 3.2.4 keeps the write of a statement that failed inside an interactive transaction and would commit
-  it. The connection is *tainted* by such a failure and refuses to commit until it is rolled back (fails closed
-  until the statement-atomicity emulation of P1.8 exists).
+* Frappe expects an autocommit-off connection (one request = one transaction). `SurrealConnection` therefore
+  opens an interactive transaction lazily on the first statement and ends it on `commit`/`rollback`.
+* SurrealDB 3.2.4 has no SAVEPOINT and no statement atomicity inside an interactive transaction: a statement
+  that fails *after* writing (UNIQUE index, ...) leaves its write behind and would commit it (P0.4 d). The
+  connection therefore keeps a **log of successful write statements** and repairs the transaction by replay:
+  on any statement error that is not provably pre-write it cancels the transaction, begins a new one and
+  re-runs the log without the failed statement (ADR 0002; unique constraints are additionally pre-checked by
+  the driver so that duplicates are raised before the write). `savepoint`/`rollback to`/`release savepoint`
+  are marks into that log.
+* Concurrency is optimistic (snapshot isolation, conflicts at COMMIT). Frappe's blocking `for_update` /
+  NOWAIT / SKIP LOCKED are built on application locks (`transactions.AppLock`: CAS on `__lock` records in
+  autocommit, plus a fenced `__fence` write inside the unit of work) and the retry hooks in `frappe.app` /
+  `frappe.utils.background_jobs` (ADR 0002, P0.7 prototype).
 * Values are bound as parameters, never interpolated. Only named (`$name`, dict) parameters exist; MariaDB-style
-  positional `%s` parameters are refused. Date/time values are refused too: ADR 0001 stores them as canonical text /
-  integers and the *translator*, which knows the column type, encodes them.
+  positional `%s` parameters are refused. Date/time values are refused too: ADR 0001 stores them as canonical
+  text / integers and the *translator*, which knows the column type, encodes them.
 * The SDK is imported lazily so that MariaDB sites never need it (it is an optional dependency).
 
 Frappe's `Database.sql()` talks to a DB-API cursor; `SurrealCursor` is the small adapter that lets the upstream
@@ -22,6 +30,7 @@ import datetime
 import decimal
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,14 +38,25 @@ from frappe.database.surrealdb.errors import (
 	CR_SERVER_GONE,
 	SurrealDBConnectionError,
 	SurrealDBError,
+	SurrealDBIntegrityError,
 	SurrealDBProgrammingError,
-	SurrealDBTransactionTainted,
+	SurrealDBTransactionConflict,
 	classify_exception,
 	classify_rpc_error,
 	classify_statement_error,
-	is_transport_exception,
-	unsupported,
 )
+from frappe.database.surrealdb.transactions import (
+	DEFAULT_LOCK_TIMEOUT,
+	DEFAULT_LOCK_TTL,
+	FENCE,
+	FENCE_TABLE,
+	LOCK_TABLE,
+	LOCK_TABLE_STATEMENTS,
+	AppLock,
+	LockTimeout,
+	fence_record_id,
+)
+from frappe.database.surrealdb.transactions import timeout_error as _timeout_error
 
 DEFAULT_NAMESPACE = "frappe"
 ADMIN_DATABASE = "_admin"  # bound by root/provisioning connections; never written to
@@ -47,6 +67,13 @@ _FIRST_WORD = re.compile(r"^\s*(\w+)")
 _KINDS_HINT = re.compile(r"/\*\s*kinds:\s*([\w,]*)\s*\*/")
 _NAMES_HINT = re.compile(r"/\*\s*names:\s*(\[.*?\])\s*\*/", re.S)
 _COLUMNS_HINT = re.compile(r"/\*\s*cols:\s*(\w+(?:\s*,\s*\w+)*)\s*\*/")
+# `/*uq:<table>:<param>*/` on a plain INSERT INTO: the driver pre-checks the table's unique indexes before
+# writing, so a duplicate raises before any row is written (SurrealDB would leave the write in the txn)
+_UQ_HINT = re.compile(r"/\*\s*uq:([\w@]+):(\w+)\s*\*/")
+# `/*lock:<mode>:k:<table>:<id>*/` = lock this record before reading (get_value with `name = x`)
+_LOCK_KEY_HINT = re.compile(r"/\*\s*lock:([lns]):k:(.+?)\s*\*/")
+# `/*lock:<mode>:t:<table>[:<limit>]*/` = the script's first statement yields the ids to lock (general filters)
+_LOCK_ROWS_HINT = re.compile(r"/\*\s*lock:([lns]):t:([\w@]+):?(\d*)\s*\*/")
 _TEMPORAL = (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)
 
 _sdk_ready = False
@@ -144,22 +171,37 @@ def _first_word(query: str) -> str:
 	return match[1].lower() if match else ""
 
 
-def last_statement_word(query: str) -> str:
-	"""First keyword of the last statement of a script, splitting on `;` outside quotes/backticks."""
-	last_start, quote = 0, None
+def split_statements(query: str) -> list[str]:
+	"""Split a script on `;` outside quotes/backticks, dropping empty tails."""
+	out, start, quote = [], 0, None
 	for i, ch in enumerate(query):
 		if quote:
 			if ch == quote:
 				quote = None
 		elif ch in "'\"`":
 			quote = ch
-		elif ch == ";" and query[i + 1 :].strip():
-			last_start = i + 1
-	return _first_word(query[last_start:])
+		elif ch == ";":
+			if query[start:i].strip():
+				out.append(query[start:i].strip())
+			start = i + 1
+	if query[start:].strip():
+		out.append(query[start:].strip())
+	return out
+
+
+def last_statement_word(query: str) -> str:
+	"""First keyword of the last statement of a script, splitting on `;` outside quotes/backticks."""
+	statements = split_statements(query)
+	return _first_word(statements[-1]) if statements else ""
 
 
 def is_read_only(query: str) -> bool:
 	return _first_word(query) in READ_ONLY_STARTS and ";" not in query.strip().rstrip(";")
+
+
+def has_write_statement(query: str) -> bool:
+	"""True if any statement of the script is a write (the unit-of-work log only records write scripts)."""
+	return any(_first_word(s) in WRITE_STARTS for s in split_statements(query))
 
 
 @dataclass
@@ -181,8 +223,24 @@ class SurrealConnection:
 		self._client_factory = client_factory
 		self._client = None
 		self._txn = None
-		self._tainted = False
 		self._lost = False
+		# Unit of work (ADR 0002): successful write statements for replay / savepoints, held app locks,
+		# the auto-retry gate and metrics.
+		self._log: list[tuple[str, dict]] = []  # successful write statements (whole script, bound params)
+		self._marks: dict[str, int] = {}  # savepoint name -> log length
+		self._locks: list[AppLock] = []
+		self.units_committed = 0  # successful commits on this connection: > 0 disables the auto-retry hook
+		self._lock_tables_ready = False
+		self._last_beat = 0.0
+		self.metrics = {
+			"conflicts": 0,
+			"retries": 0,
+			"replays": 0,
+			"replayed_stmts": 0,
+			"lock_waits": 0,
+			"lock_wait_ms": 0.0,
+			"lock_lost": 0,
+		}
 		self.statement_timeout: int | None = (
 			None  # seconds; rendered as a TIMEOUT clause by the translator (P1.6)
 		)
@@ -203,7 +261,10 @@ class SurrealConnection:
 		except Exception as e:
 			self._close_quietly(client)
 			raise classify_exception(e) from e
-		self._client, self._txn, self._tainted, self._lost = client, None, False, False
+		self._client = client
+		self._txn = None
+		self._lost = False
+		self._reset_unit()
 		return self
 
 	def select_db(self, database: str):
@@ -230,54 +291,155 @@ class SurrealConnection:
 				"SurrealDB connection is not open (lost or closed); reconnect before running queries.",
 			)
 
+	def _mark_lost(self):
+		"""The session is gone: server-side transaction and unit state are dead."""
+		self._lost, self._txn = True, None
+		self._reset_unit()
+
+	def _reset_unit(self):
+		"""Forget everything about the current unit of work (its transaction is gone)."""
+		self._log = []
+		self._marks = {}
+		self._locks = []
+
 	# --- transactions ----------------------------------------------------------------------------------------
 	@property
 	def in_transaction(self) -> bool:
 		return self._txn is not None
 
+	def _ensure_txn(self):
+		if self._txn is None:
+			self._txn = self._call(self._client.begin)
+		return self._txn
+
+	def _cancel_txn(self):
+		"""Best-effort cancel of an open transaction (used for discard/replay; errors are swallowed)."""
+		txn, self._txn = self._txn, None
+		if txn is not None:
+			try:
+				self._client.cancel(txn)
+			except Exception:
+				pass
+
 	def begin(self):
 		self._require_open()
 		if self._txn is not None:
 			self.commit()  # MariaDB: START TRANSACTION implicitly commits the current one
-		self._txn = self._call(self._client.begin)
+		# No server round trip: MariaDB's plain START TRANSACTION takes no snapshot - the read view is
+		# fixed by the first real statement, not by BEGIN. SurrealDB's begin would pin the snapshot here,
+		# and frappe.db.commit() always trails a begin(), so every later read in the unit would see data
+		# as of the commit instead of the first read (measured live, P1.8 b/c: the counter stayed at its
+		# seed value). Lazy: the first statement opens the transaction via _ensure_txn.
 
 	def commit(self):
+		"""Commit the unit of work. On an optimistic conflict the transaction is already rolled back on the
+		server: release the locks, forget the unit and raise (the retry hooks re-run the unit, ADR 0002)."""
 		if self._txn is None:
 			return
-		if self._tainted:
-			raise SurrealDBTransactionTainted(
-				0,
-				"A statement failed inside this transaction and SurrealDB would still commit its write. "
-				"Roll back instead (statement-level atomicity is implemented in P1.8).",
-			)
 		txn, self._txn = self._txn, None
-		self._call(self._client.commit, txn)
+		try:
+			self._call(self._client.commit, txn)
+		except SurrealDBError as e:
+			if isinstance(e, SurrealDBTransactionConflict):
+				self.metrics["conflicts"] += 1
+			self._release_locks_quietly()
+			self._reset_unit()
+			raise
+		self.units_committed += 1
+		self._release_locks_quietly()
+		self._reset_unit()
 
 	def rollback(self):
-		txn, self._txn, self._tainted = self._txn, None, False
+		txn, self._txn = self._txn, None
 		if txn is not None:
 			self._call(self._client.cancel, txn)
+		self._release_locks_quietly()
+		self._reset_unit()
 
+	# --- savepoints (statement-log marks; SurrealDB has no SAVEPOINT syntax) -----------------------------------
+	def savepoint(self, name: str):
+		self._ensure_txn()
+		self._marks[name] = len(self._log)
+
+	def rollback_to(self, name: str):
+		if name not in self._marks:
+			raise SurrealDBProgrammingError(1305, f"SAVEPOINT {name} does not exist")
+		idx = self._marks[name]
+		for later in [n for n, i in self._marks.items() if i > idx]:
+			del self._marks[later]  # MariaDB: ROLLBACK TO releases savepoints taken after it
+		if len(self._log) != idx:
+			self._replay(idx)
+
+	def release_savepoint(self, name: str):
+		if name not in self._marks:
+			raise SurrealDBProgrammingError(1305, f"SAVEPOINT {name} does not exist")
+		del self._marks[name]
+
+	def _replay(self, upto: int):
+		"""Statement atomicity / savepoint emulation: cancel the transaction, begin anew and re-run the first
+		`upto` logged write statements (measured 6/72/301 ms for 10/100/500 statements, P0.7)."""
+		keep = self._log[:upto]
+		marks = {name: idx for name, idx in self._marks.items() if idx <= upto}
+		self._cancel_txn()
+		try:
+			self._txn = self._call(self._client.begin)
+			for sql, bound in keep:
+				self._raw(sql, bound, self._txn)
+		except SurrealDBError as e:
+			self._txn, self._log, self._marks = None, [], {}
+			raise SurrealDBTransactionConflict(
+				0, f"Replay diverged after a failed statement; the unit of work cannot continue: {e}"
+			) from e
+		self._log, self._marks = keep, marks
+		self.metrics["replays"] += 1
+		self.metrics["replayed_stmts"] += len(keep)
+
+	# --- raw execution ----------------------------------------------------------------------------------------
 	def _call(self, fn, *args, **kwargs):
 		try:
 			return fn(*args, **kwargs)
 		except Exception as e:
 			err = classify_exception(e)
 			if isinstance(err, SurrealDBConnectionError):
-				self._lost, self._txn = True, None
+				self._mark_lost()
 			raise err from e
 
-	# --- statements ------------------------------------------------------------------------------------------
-	def execute(self, query: str, params=None) -> list:
-		"""Run one query text (one or more statements). Returns the decoded result of each statement.
+	def _raw(self, query: str, bound: dict, txn_id) -> list:
+		"""One query text over the wire: RPC errors and every statement's status are classified."""
+		try:
+			raw = self._client.query_raw(query, bound, txn_id=txn_id)
+		except Exception as e:
+			err = classify_exception(e)
+			if isinstance(err, SurrealDBConnectionError):
+				self._mark_lost()
+			raise err from e
+		if raw.get("error"):
+			raise classify_rpc_error(raw["error"])
+		results = []
+		for statement in raw.get("result") or []:
+			if statement.get("status") != "OK":
+				raise classify_statement_error(statement.get("result"))
+			results.append(decode_value(statement.get("result")))
+		return results
 
-		Every statement's status is checked; the first failure raises a classified error. Outside a transaction a
-		multi-statement script is *not* atomic (SurrealDB behaviour) - callers that need atomicity use a transaction."""
+	def _autocommit_raw(self, query: str, params=None) -> list:
+		"""One statement in autocommit (its own transaction), never touching the unit of work."""
+		return self._raw(query, encode_params(params), None)
+
+	def execute(self, query: str, params=None) -> list:
+		"""Run one query text (one or more statements) as part of the current unit of work.
+
+		Every statement's status is checked; the first failure raises a classified error. Statement atomicity
+		is restored by replaying the write log when a failure was not provably pre-write (module docstring).
+		Outside a transaction a multi-statement script is *not* atomic (SurrealDB behaviour) - callers that
+		need atomicity use a transaction."""
 		bound = encode_params(params)
 		self._require_open()
+		self._maybe_heartbeat()
+		self._precheck_insert(query, bound)  # raises before any write; never replayed
 		had_transaction = self._txn is not None
 		try:
-			return self._execute_once(query, bound)
+			results = self._execute_once(query, bound)
 		except SurrealDBConnectionError:
 			# Lost the socket. Retry once on a fresh session, but only a read-only query and only if no
 			# transaction was open when it started: a retry must never repeat a write or hide lost work.
@@ -285,38 +447,190 @@ class SurrealConnection:
 				self._reopen()
 				return self._execute_once(query, bound)
 			raise
+		except SurrealDBError as e:
+			self._recover_statement_error(e)
+			raise
+		if self._txn is not None and has_write_statement(query):
+			self._log.append((query, bound))
+		return results
+
+	def _execute_once(self, query: str, bound: dict) -> list:
+		if self.params.implicit_transaction and self._txn is None:
+			self._txn = self._call(self._client.begin)
+		return self._raw(query, bound, self._txn)
+
+	def _recover_statement_error(self, e: SurrealDBError):
+		"""Repair the unit after a failed statement (module docstring)."""
+		if self._txn is None:
+			return  # autocommit statements are atomic on their own
+		if isinstance(e, SurrealDBTransactionConflict):
+			# MariaDB: a deadlock (1213) aborts the whole transaction
+			self.metrics["conflicts"] += 1
+			self._cancel_txn()
+			self._release_locks_quietly()
+			self._reset_unit()
+			return
+		if not self._failed_pre_write(e):
+			# The statement wrote and then failed: undo everything since the last savepoint boundary
+			self._replay(len(self._log))
+		# provably pre-write failures leave nothing behind
+
+	@staticmethod
+	def _failed_pre_write(e: SurrealDBError) -> bool:
+		"""Errors measured to fire *before* any write (P0.4 d2b) need no replay."""
+		if isinstance(e, SurrealDBProgrammingError):
+			return True  # parse errors, unknown table/field/index
+		m = str(e.raw).lower()
+		if "already exists" in m and "index" not in m:
+			return True  # duplicate record id
+		return "couldn't coerce" in m or ("found" in m and "for field" in m)  # coercion / ASSERT
 
 	def _reopen(self):
 		self.close()
 		self.open()
 
-	def _execute_once(self, query: str, bound: dict) -> list:
-		if self.params.implicit_transaction and self._txn is None:
-			self._txn = self._call(self._client.begin)
-		try:
-			raw = self._client.query_raw(query, bound, txn_id=self._txn)
-		except Exception as e:
-			err = classify_exception(e)
-			if isinstance(err, SurrealDBConnectionError):
-				self._lost, self._txn = True, None
-			raise err from e
-		if raw.get("error"):
-			self._taint()
-			raise classify_rpc_error(raw["error"])
-		results = []
-		for statement in raw.get("result") or []:
-			if statement.get("status") != "OK":
-				self._taint()
-				raise classify_statement_error(statement.get("result"))
-			results.append(decode_value(statement.get("result")))
-		return results
+	# --- unique pre-check --------------------------------------------------------------------------------------
+	def _precheck_insert(self, query: str, bound: dict):
+		"""`/*uq:<table>:<param>*/` on a plain INSERT INTO: check the table's unique indexes against the rows
+		about to be written (+1 indexed read per insert), so a duplicate raises *before* the write (ADR 0002;
+		SurrealDB would leave the failed statement's write in the transaction, P0.4 d2b). Race-safe: the real
+		index still enforces at write time and the replay then undoes the failed statement."""
+		hint = _UQ_HINT.search(query)
+		if hint is None:
+			return
+		table, param = hint[1], hint[2]
+		rows = bound.get(param)
+		if not isinstance(rows, list) or not rows or not all(isinstance(r, dict) for r in rows):
+			return
+		schema = self._schema_loader(table)
+		unique = [
+			ix
+			for ix in schema.indexes.values()
+			if ix["unique"]
+			and not any(_index_base_field(f) == "name" for f in ix["fields"])  # `name` is the record id
+		]
+		if not unique:
+			return
+		for ix in unique:
+			for row in rows:
+				values = {f"u{i}": row.get(f) for i, f in enumerate(ix["fields"])}
+				if any(v is None or v is SNULL for v in values.values()):
+					continue  # MariaDB: NULL never violates UNIQUE (bound params arrive encoded as SNULL)
+				where = " AND ".join(quote_field(f, f"$u{i}") for i, f in enumerate(ix["fields"]))
+				found = self._txn_read(f"SELECT VALUE id FROM {_quote_table(table)} WHERE {where} LIMIT 1", values)
+				if found:
+					display = "-".join(str(v) for v in values.values())
+					raise SurrealDBIntegrityError(
+						1062, f"Duplicate entry '{display}' for key '{ix['name']}'"
+					)
 
-	def _taint(self):
-		if self._txn is not None:
-			self._tainted = True
+	def _schema_loader(self, table: str):
+		"""Hook for tests; the real loader reads `INFO FOR TABLE` (cached per request)."""
+		from frappe.database.surrealdb.schema import table_schema
+
+		return table_schema(table)
+
+	def _txn_read(self, query: str, params: dict) -> list:
+		"""A read inside the current transaction (sees committed data plus this unit's own writes)."""
+		self._ensure_txn()
+		results = self._raw(query, encode_params(params), self._txn)
+		return results[-1] if results else []  # the rows of the (single) statement, not the wrapper
+
+	# --- application locks (ADR 0002 / P0.7) ---------------------------------------------------------------------
+	def _ensure_lock_tables(self):
+		if self._lock_tables_ready:
+			return
+		try:
+			self._autocommit_raw("; ".join(LOCK_TABLE_STATEMENTS))
+		except SurrealDBError:
+			# a concurrent connection may have created them between the check and the DEFINE
+			info = self._autocommit_raw(f"INFO FOR TABLE {LOCK_TABLE}; INFO FOR TABLE {FENCE_TABLE}")
+			if not (info and all(info)):
+				raise
+		self._lock_tables_ready = True
+
+	def lock(self, key: str, timeout: float = DEFAULT_LOCK_TIMEOUT, ttl: float = DEFAULT_LOCK_TTL) -> bool:
+		"""Blocking application lock for `for_update`. timeout=0 -> NOWAIT. Raises LockTimeout (-> 1205).
+
+		After the grant: a transaction without writes is dropped for a fresh snapshot (its reads must see the
+		previous holder's commit, P0.4 a1), then the fenced write makes a stale snapshot conflict at commit."""
+		for held in self._locks:
+			if held.key == key:
+				return False
+		self._maybe_heartbeat()  # a long wait for this lock must not expire the ones already held
+		self._ensure_lock_tables()
+		app_lock = AppLock(self, key, ttl)
+		waited = app_lock.acquire(timeout)  # LockTimeout propagates to the caller
+		self._locks.append(app_lock)
+		self._last_beat = time.monotonic()  # the grant refreshed the expiry; beat from here
+		if waited > 0:
+			self.metrics["lock_waits"] += 1
+			self.metrics["lock_wait_ms"] += waited * 1000
+		if self._txn is not None and not self._log:
+			self._cancel_txn()  # fresh snapshot
+		self._txn_write(FENCE, {"r": fence_record_id(key)})
+		return True
+
+	def try_lock(self, key: str, ttl: float = DEFAULT_LOCK_TTL) -> bool:
+		"""SKIP LOCKED building block: returns False instead of waiting."""
+		try:
+			return self.lock(key, timeout=0.0, ttl=ttl)
+		except LockTimeout:
+			return False
+
+	def holds(self, key: str) -> bool:
+		"""Whether this connection already holds the application lock for `key` (its own unit)."""
+		return any(held.key == key for held in self._locks)
+
+	def _txn_write(self, sql: str, params: dict):
+		"""A driver-issued write inside the unit of work, logged for replay like any other write."""
+		self._ensure_txn()
+		self._raw(sql, encode_params(params), self._txn)
+		self._log.append((sql, encode_params(params)))
+
+	def _release_locks_quietly(self):
+		locks, self._locks = self._locks, []
+		for app_lock in reversed(locks):
+			try:
+				app_lock.release()
+			except Exception:
+				pass  # an expired/stolen lock is released by its TTL; never mask the unit's outcome
+
+	def _maybe_heartbeat(self):
+		"""Refresh the expiry of held locks while the unit runs (long units must not lose their locks)."""
+		if not self._locks:
+			return
+		now = time.monotonic()
+		ttl = max(lk.ttl for lk in self._locks) / 1_000_000
+		if now - self._last_beat < max(ttl / 3, 1.0):
+			return
+		self._last_beat = now
+		for app_lock in self._locks:
+			if not app_lock.refresh():
+				self.metrics["lock_lost"] += 1
 
 	def cursor(self) -> "SurrealCursor":
 		return SurrealCursor(self)
+
+
+def _index_base_field(stored: str) -> str:
+	"""`code@ci` -> `code` (the column an index field belongs to)."""
+	from frappe.database.surrealdb.schema import base_field
+
+	return base_field(stored)
+
+
+def _quote_table(table: str) -> str:
+	from frappe.database.surrealdb.schema import quote_table
+
+	return quote_table(table)
+
+
+def quote_field(stored: str, placeholder: str) -> str:
+	"""`code@ci` -> `` `code@ci` = $u0 `` (shadow fields compare with the exact unique-index semantics)."""
+	from frappe.database.surrealdb.schema import quote
+
+	return f"{quote(stored)} = {placeholder}"
 
 
 class SurrealCursor:
@@ -328,6 +642,11 @@ class SurrealCursor:
 	rows follow it and missing fields become None. Without one, results are ordered alphabetically, which is only
 	safe for consumers that read by name (`as_dict`); a multi-column result consumed positionally without a hint
 	raises instead of silently scrambling columns (`require_order`, set by `SurrealDBDatabase.sql`).
+
+	Lock contract (P1.8). `/*lock:<mode>:k:<key>*/` locks one record before reading (blocking `l`, NOWAIT `n`).
+	`/*lock:<mode>:t:<table>*/` marks a two-statement script whose first statement yields the ids to lock; the
+	rows are re-read after the grants so the caller sees fresh values, and SKIP LOCKED (`s`) drops the locked
+	rows from the result instead.
 	"""
 
 	require_order = True
@@ -358,8 +677,18 @@ class SurrealCursor:
 		if lowered in ("rollback", "rollback and chain"):
 			self.connection.rollback()
 			return self.connection.begin() if lowered.endswith("chain") else None
-		if lowered.startswith(("savepoint", "release savepoint", "rollback to")):
-			unsupported("savepoints (statement-level atomicity emulation)", "P1.8")
+		if lowered.startswith("savepoint"):
+			self.connection.savepoint(lowered[len("savepoint") :].strip())
+			return None
+		if lowered.startswith("release savepoint"):
+			self.connection.release_savepoint(lowered[len("release savepoint") :].strip())
+			return None
+		if lowered.startswith("rollback to"):
+			name = lowered[len("rollback to") :].strip()
+			if name.lower().startswith("savepoint"):
+				name = name[len("savepoint") :].strip()
+			self.connection.rollback_to(name)
+			return None
 
 		hint = _COLUMNS_HINT.search(text)
 		columns = [c.strip() for c in hint[1].split(",")] if hint else None
@@ -367,7 +696,26 @@ class SurrealCursor:
 		kinds = kinds_hint[1].split(",") if kinds_hint else None
 		names_hint = _NAMES_HINT.search(text)
 		names = json.loads(names_hint[1].replace("\\/", "/")) if names_hint else None
-		results = self.connection.execute(text, values)
+
+		lock_key, lock_rows = _LOCK_KEY_HINT.search(text), _LOCK_ROWS_HINT.search(text)
+		if lock_key is not None and lock_rows is None:
+			# lock the record before reading it: the read then sees the previous holder's commit
+			self._acquire_lock(lock_key[1], lock_key[2])
+			results = self.connection.execute(text, values)
+		elif lock_rows is not None:
+			# two-statement script: [ids to lock, the query itself]; re-read after the grants
+			mode, table = lock_rows[1], lock_rows[2]
+			results = self.connection.execute(text, values)
+			granted = self._lock_rows(mode, table, results[0], lock_rows[3] or None)
+			results = self.connection.execute(text, values)
+			rows = results[-1] if results else None
+			if mode == "s" and isinstance(rows, list):
+				# SKIP LOCKED: the result keeps only the rows this connection claimed
+				keep = {f"{table}:{rid}" for rid in granted}
+				results[-1] = [row for row in rows if f"{table}:{row.get('__lk0')}" in keep]
+		else:
+			results = self.connection.execute(text, values)
+
 		last = results[-1] if results else None
 		if last_statement_word(text) in WRITE_STARTS:
 			# MariaDB returns no result set for writes, only a row count
@@ -377,6 +725,40 @@ class SurrealCursor:
 			if kinds:
 				self._decode(kinds)
 		return None
+
+	def _acquire_lock(self, mode: str, key: str):
+		"""Blocking (`l`) or NOWAIT (`n`) single-record lock. Errors map to MariaDB's 1205 shape."""
+		try:
+			self.connection.lock(key, timeout=0.0 if mode == "n" else DEFAULT_LOCK_TIMEOUT)
+		except LockTimeout as e:
+			raise _timeout_error(0.0 if mode == "n" else DEFAULT_LOCK_TIMEOUT) from e
+
+	def _lock_rows(self, mode: str, table: str, ids, want=None) -> list:
+		"""Grant the row locks (blocking / NOWAIT), or claim the unlocked ones for `s` — at most `want` of
+		them (the query's LIMIT), in candidate order. Returns the granted record ids."""
+		timeout = 0.0 if mode == "n" else DEFAULT_LOCK_TIMEOUT
+		want = int(want) if want else None
+		granted = []
+		try:
+			for row in ids or []:
+				record_id = row.get("__lk0") if isinstance(row, dict) else row
+				if record_id is None:
+					continue
+				if want is not None and len(granted) >= want:
+					break
+				if mode == "s":
+					# a row this unit already holds is ours, not a foreign one: MariaDB's SKIP LOCKED
+					# does not skip a transaction's own locks
+					if self.connection.try_lock(f"{table}:{record_id}") or self.connection.holds(
+						f"{table}:{record_id}"
+					):
+						granted.append(record_id)
+				else:
+					self.connection.lock(f"{table}:{record_id}", timeout=timeout)
+					granted.append(record_id)
+		except LockTimeout as e:
+			raise _timeout_error(timeout) from e
+		return granted
 
 	def _shape(self, result, hint=None, names=None):
 		"""Turn a statement result into DB-API columns/rows. Rows are dicts (`SELECT`) or scalars (`SELECT VALUE`)."""

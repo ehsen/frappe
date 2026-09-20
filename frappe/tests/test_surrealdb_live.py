@@ -174,13 +174,13 @@ class TestSurrealDBLive(LiveSurrealDB, UnitTestCase):
 		db.commit()
 		db.sql("CREATE tabT:z SET name = 'z', n = 9")
 		with self.assertRaises(E.SurrealDBIntegrityError):
-			db.sql("CREATE tabT:dup SET name = 'a', n = 2")  # the write SurrealDB 3.2.4 would keep and commit
-		with self.assertRaises(E.SurrealDBTransactionTainted):
-			db.commit()
-		db.rollback()
+			db.sql("CREATE tabT:dup SET name = 'a', n = 2")  # SurrealDB 3.2.4 keeps this row in the unit
+		# P1.8 statement atomicity (P0.4 d2b): the failed statement is replayed away on a fresh
+		# transaction, so the unit commits - with tabT:z, without the ghost row tabT:dup.
+		db.commit()
 		other = self.connect(*creds)
 		self.addCleanup(other.close)
-		self.assertEqual(other.sql("SELECT name FROM tabT ORDER BY name", pluck=True), ["a"])
+		self.assertEqual(other.sql("SELECT name FROM tabT ORDER BY name", pluck=True), ["a", "z"])
 
 	def test_connection_survives_reuse_after_commit_and_rollback(self):
 		db, _ = self.make_site_db()

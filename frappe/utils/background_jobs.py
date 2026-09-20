@@ -238,6 +238,8 @@ def run_doc_method(doctype, name, doc_method, **kwargs):
 
 def execute_job(site, method, event, job_name, kwargs, user=None, is_async=True, retry=0):
 	"""Executes job in a worker, performs commit/rollback and logs if there is any error"""
+	from frappe.database.surrealdb.transactions import retry_job_conflict
+
 	retval = None
 
 	if is_async:
@@ -271,6 +273,10 @@ def execute_job(site, method, event, job_name, kwargs, user=None, is_async=True,
 
 	try:
 		retval = method(**kwargs)
+		if frappe.db.db_type == "surrealdb":
+			# ADR 0002: the unit-of-work commit can conflict on SurrealDB, so it runs inside the retry
+			# region. Every other engine commits in the else branch below, exactly as before.
+			frappe.db.commit(chain=True)
 
 	except (frappe.db.InternalError, frappe.RetryBackgroundJobError) as e:
 		frappe.db.rollback(chain=True)
@@ -295,6 +301,15 @@ def execute_job(site, method, event, job_name, kwargs, user=None, is_async=True,
 
 	except Exception as e:
 		frappe.db.rollback(chain=True)
+
+		if retry_job_conflict(e, retry):
+			# SurrealDB (ADR 0002): a retryable commit conflict re-runs the whole job with fresh data
+			frappe.job.after_job.reset()
+			frappe.destroy()
+			time.sleep(retry + 1)
+
+			return execute_job(site, method, event, job_name, kwargs, is_async=is_async, retry=retry + 1)
+
 		frappe.log_error(title=method_name)
 		frappe.monitor.add_data_to_monitor(exception=e.__class__.__name__)
 		frappe.db.commit(chain=True)
@@ -302,7 +317,8 @@ def execute_job(site, method, event, job_name, kwargs, user=None, is_async=True,
 		raise
 
 	else:
-		frappe.db.commit(chain=True)
+		if frappe.db.db_type != "surrealdb":
+			frappe.db.commit(chain=True)
 		return retval
 
 	finally:
