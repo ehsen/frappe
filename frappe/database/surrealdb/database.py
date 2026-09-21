@@ -457,6 +457,22 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 				self.sql_ddl(index_statement(table, new_name, fields, unique=ix["unique"]))
 		self._remove_column_definitions(table, old_s, spec.is_varchar)
 
+	def drop_columns(self, doctype: str, columns: list[str]) -> list | tuple:
+		"""Drop columns (and their shadow columns) from a table. Mirrors MariaDB's
+		ALTER TABLE ... DROP COLUMN, including its implicit commit."""
+		table = get_table_name(doctype)
+		info = self.table_info(table)
+		for column in columns:
+			meta = info.columns.get(column)
+			if meta is None:
+				raise SurrealDBProgrammingError(
+					ER_CANT_DROP_FIELD_OR_KEY, f"Can't DROP '{column}'; check that column/key exists"
+				)
+			spec = ColumnSpec(column, meta["t"], nullable=bool(meta["n"]))
+			self._remove_column_definitions(table, physical(column), spec.is_varchar)
+		self.commit()
+		return ()
+
 	def _remove_column_definitions(self, table: str, stored: str, shadowed: bool):
 		"""Drop a column. `REMOVE FIELD` leaves the stored values behind (and a SCHEMAFULL table then rejects them on the
 		next copy/update), so they are unset too - after the definition is gone, because a still-defined `string | null`
@@ -487,6 +503,10 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 
 	def create_user_settings_table(self):
 		self._create_system_table("__UserSettings")
+
+	def create_singles_table(self):
+		"""MariaDB's tabSingles (`frappe.qb.into("Singles")` resolves to `tabSingles` via get_table_name)."""
+		self._create_system_table("tabSingles")
 
 	@staticmethod
 	def get_on_duplicate_update():

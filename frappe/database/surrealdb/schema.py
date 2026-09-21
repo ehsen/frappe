@@ -653,6 +653,7 @@ SYSTEM_KEYS = {
 	"__Auth": ("doctype", "name", "fieldname"),
 	"__global_search": ("doctype", "name"),
 	"__UserSettings": ("user", "doctype"),
+	"tabSingles": ("doctype", "field"),
 }
 
 
@@ -695,6 +696,13 @@ def system_table_statements(name: str) -> list[str]:
 			ColumnSpec("data", "text"),
 		]
 		unique = ("user", ["user", "doctype"])
+	elif name == "tabSingles":
+		cols = [
+			ColumnSpec("doctype", "varchar(180)", False),
+			ColumnSpec("field", "varchar(180)", False),
+			ColumnSpec("value", "longtext", True),
+		]
+		unique = ("PRIMARY", ["doctype", "field"])
 	else:
 		raise SurrealDBProgrammingError(0, f"Unknown system table {name!r}")
 	stmts = [f"DEFINE TABLE {quote_table(name)} SCHEMAFULL"]
