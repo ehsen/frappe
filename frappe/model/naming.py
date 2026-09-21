@@ -412,13 +412,12 @@ def getseries(key, digits):
 	current = (frappe.qb.from_(series).where(series.name == key).for_update().select("current")).run()
 
 	if current and current[0][0] is not None:
-		current = current[0][0]
-		# yes, update it
-		frappe.db.sql("UPDATE `tabSeries` SET `current` = `current` + 1 WHERE `name`=%s", (key,))
-		current = cint(current) + 1
+		# yes, update it (the FOR UPDATE above holds the row lock, so read-then-write is atomic)
+		current = cint(current[0][0]) + 1
+		frappe.qb.update(series).set(series.current, current).where(series.name == key).run()
 	else:
 		# no, create it
-		frappe.db.sql("INSERT INTO `tabSeries` (`name`, `current`) VALUES (%s, 1)", (key,))
+		frappe.qb.into(series).columns("name", "current").insert(key, 1).run()
 		current = 1
 	return ("%0" + str(digits) + "d") % current
 
@@ -475,7 +474,8 @@ def revert_series_if_last(key, name, doc=None):
 	current = (frappe.qb.from_(series).where(series.name == prefix).for_update().select("current")).run()
 
 	if current and current[0][0] == count:
-		frappe.db.sql("UPDATE `tabSeries` SET `current` = `current` - 1 WHERE `name`=%s", prefix)
+		# the FOR UPDATE above holds the row lock, so decrementing to an absolute value is atomic
+		frappe.qb.update(series).set(series.current, count - 1).where(series.name == prefix).run()
 
 
 def get_default_naming_series(doctype: str) -> str | None:
@@ -528,18 +528,29 @@ def append_number_if_name_exists(doctype, value, fieldname="name", separator="-"
 	regex = f"^{re.escape(value)}{separator}\\d+$"
 
 	if exists:
-		last = frappe.db.sql(
-			f"""SELECT `{fieldname}` FROM `tab{doctype}`
-			WHERE `{fieldname}` {frappe.db.REGEX_CHARACTER} %s
-			ORDER BY length({fieldname}) DESC,
-			`{fieldname}` DESC LIMIT 1""",
-			regex,
-		)
-
-		if last:
-			count = str(cint(last[0][0].rsplit(separator, 1)[1]) + 1)
+		if frappe.db.db_type == "surrealdb":
+			# SurrealDB has no REGEXP: fetch the sibling names and replicate the
+			# `ORDER BY length(name) DESC, name DESC LIMIT 1` scan in Python.
+			matches = [
+				name
+				for name in frappe.db.get_values(doctype, {fieldname: ("like", f"{value}{separator}%")}, pluck=fieldname)
+				if name and re.fullmatch(regex, cstr(name))
+			]
+			matches.sort(key=lambda n: (len(n), n), reverse=True)
+			count = str(cint(matches[0].rsplit(separator, 1)[1]) + 1) if matches else "1"
 		else:
-			count = "1"
+			last = frappe.db.sql(
+				f"""SELECT `{fieldname}` FROM `tab{doctype}`
+				WHERE `{fieldname}` {frappe.db.REGEX_CHARACTER} %s
+				ORDER BY length({fieldname}) DESC,
+				`{fieldname}` DESC LIMIT 1""",
+				regex,
+			)
+
+			if last:
+				count = str(cint(last[0][0].rsplit(separator, 1)[1]) + 1)
+			else:
+				count = "1"
 
 		value = f"{value}{separator}{count}"
 

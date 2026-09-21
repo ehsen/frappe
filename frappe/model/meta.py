@@ -21,6 +21,7 @@ import typing
 from datetime import datetime
 
 import click
+from pypika import Order
 
 import frappe
 from frappe import _, _lt
@@ -504,10 +505,14 @@ class Meta(Document):
 			return
 
 		if frappe.db.estimate_count(self.name) > LARGE_TABLE_SIZE_THRESHOLD:
-			# Raw SQL to prevent querying meta when already in meta
-			recent_change = frappe.db.sql(
-				f"SELECT `creation` FROM `tab{self.name}` ORDER BY `creation` DESC LIMIT 1"
-			)  # nosemgrep
+			# qb (not the ORM) to prevent querying meta when already in meta
+			recent_change = (
+				frappe.qb.from_(frappe.qb.DocType(self.name))
+				.select("creation")
+				.orderby("creation", order=Order.desc)
+				.limit(1)
+				.run()
+			)
 			if recent_change and get_datetime(recent_change[0][0]) > add_to_date(
 				None, days=-1 * LARGE_TABLE_RECENCY_THRESHOLD
 			):
@@ -1000,8 +1005,12 @@ def trim_table(doctype, dry_run=True):
 	DROPPED_COLUMNS = columns_to_remove[:]
 
 	if columns_to_remove and not dry_run:
-		columns_to_remove = ", ".join(f"DROP `{c}`" for c in columns_to_remove)
-		frappe.db.sql_ddl(f"ALTER TABLE `tab{doctype}` {columns_to_remove}")
+		if frappe.db.db_type == "surrealdb":
+			# SurrealDB has no ALTER TABLE DROP COLUMN; route through the backend
+			frappe.db.drop_columns(doctype, columns_to_remove)
+		else:
+			columns_to_remove = ", ".join(f"DROP `{c}`" for c in columns_to_remove)
+			frappe.db.sql_ddl(f"ALTER TABLE `tab{doctype}` {columns_to_remove}")
 
 	return DROPPED_COLUMNS
 

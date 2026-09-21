@@ -2,27 +2,36 @@
 # License: MIT. See LICENSE
 
 import frappe
+from frappe.query_builder import DocType
 
 # select doctypes that are accessed by the user (not read_only) first, so that the
 # the validation message shows the user-facing doctype first.
 # For example Journal Entry should be validated before GL Entry (which is an internal doctype)
 
-dynamic_link_queries = [
-	"""select `tabDocField`.parent,
-		`tabDocType`.read_only, `tabDocType`.in_create,
-		`tabDocField`.fieldname, `tabDocField`.options
-	from `tabDocField`, `tabDocType`
-	where `tabDocField`.fieldtype='Dynamic Link' and
-	`tabDocType`.`name`=`tabDocField`.parent and `tabDocType`.is_virtual = 0 and `tabDocField`.is_virtual = 0
-	order by `tabDocType`.read_only, `tabDocType`.in_create""",
-	"""select `tabCustom Field`.dt as parent,
-		`tabDocType`.read_only, `tabDocType`.in_create,
-		`tabCustom Field`.fieldname, `tabCustom Field`.options
-	from `tabCustom Field`, `tabDocType`
-	where `tabCustom Field`.fieldtype='Dynamic Link' and
-	`tabDocType`.`name`=`tabCustom Field`.dt
-	order by `tabDocType`.read_only, `tabDocType`.in_create""",
-]
+
+def get_dynamic_link_queries():
+	"""The dynamic-link field queries, built through the qb layer (P1.9a: the raw SQL was MariaDB dialect)."""
+	DocField, CustomField, Dt = DocType("DocField"), DocType("Custom Field"), DocType("DocType")
+	return [
+		frappe.qb.from_(DocField)
+		.inner_join(Dt)
+		.on(DocField.parent == Dt.name)
+		.select(DocField.parent, Dt.read_only, Dt.in_create, DocField.fieldname, DocField.options)
+		.where(DocField.fieldtype == "Dynamic Link")
+		.where(Dt.is_virtual == 0)
+		.where(DocField.is_virtual == 0)
+		.orderby(Dt.read_only)
+		.orderby(Dt.in_create),
+		frappe.qb.from_(CustomField)
+		.inner_join(Dt)
+		.on(CustomField.dt == Dt.name)
+		.select(
+			CustomField.dt.as_("parent"), Dt.read_only, Dt.in_create, CustomField.fieldname, CustomField.options
+		)
+		.where(CustomField.fieldtype == "Dynamic Link")
+		.orderby(Dt.read_only)
+		.orderby(Dt.in_create),
+	]
 
 
 def get_dynamic_link_map(for_delete=False):
@@ -56,8 +65,8 @@ def get_dynamic_links():
 	"""Return list of dynamic link fields as DocField.
 	Uses cache if possible"""
 	df = []
-	for query in dynamic_link_queries:
-		df += frappe.db.sql(query, as_dict=True)
+	for query in get_dynamic_link_queries():
+		df += query.run(as_dict=True)
 	return df
 
 
@@ -78,7 +87,8 @@ def fetch_distinct_link_doctypes(doctype: str, fieldname: str):
 	doctypes = frappe.cache.get_value(key)
 
 	if doctypes is None:
-		doctypes = frappe.db.sql(f"""select distinct `{fieldname}` from `tab{doctype}`""", pluck=True)
+		table = DocType(doctype)
+		doctypes = frappe.qb.from_(table).select(table[fieldname]).distinct().run(pluck=True)
 		frappe.cache.set_value(key, doctypes, expires_in_sec=12 * 60 * 60)
 
 	return doctypes

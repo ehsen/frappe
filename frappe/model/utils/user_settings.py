@@ -5,6 +5,7 @@ import json
 
 import frappe
 from frappe import safe_decode
+from frappe.query_builder import Table
 
 # dict for mapping the index and index type for the filters of different views
 filter_dict = {"doctype": 0, "docfield": 1, "operator": 2, "value": 3}
@@ -14,12 +15,15 @@ def get_user_settings(doctype, for_update=False):
 	user_settings = frappe.cache.hget("_user_settings", f"{doctype}::{frappe.session.user}")
 
 	if user_settings is None:
-		user_settings = frappe.db.sql(
-			"""select data from `__UserSettings`
-			where `user`=%s and `doctype`=%s""",
-			(frappe.session.user, doctype),
+		__UserSettings = Table("__UserSettings")
+		rows = (
+			frappe.qb.from_(__UserSettings)
+			.select(__UserSettings.data)
+			.where(__UserSettings.user == frappe.session.user)
+			.where(__UserSettings.doctype == doctype)
+			.run()
 		)
-		user_settings = (user_settings and user_settings[0][0]) or "{}"
+		user_settings = (rows and rows[0][0]) or "{}"
 
 		if not for_update:
 			update_user_settings(doctype, user_settings, True)
@@ -48,6 +52,13 @@ def sync_user_settings():
 	for key, data in frappe.cache.hgetall("_user_settings").items():
 		key = safe_decode(key)
 		doctype, user = key.split("::")  # WTF?
+		if frappe.db.db_type == "surrealdb":
+			# P1.9a: the INSERT .. ON DUPLICATE KEY UPDATE / ON CONFLICT raw SQL is engine dialect
+			__UserSettings = Table("__UserSettings")
+			frappe.qb.into(__UserSettings).columns("user", "doctype", "data").insert(
+				user, doctype, data
+			).on_duplicate_key_update(__UserSettings.data, data).run()
+			continue
 		frappe.db.multisql(
 			{
 				"mariadb": """INSERT INTO `__UserSettings`(`user`, `doctype`, `data`)
@@ -95,10 +106,10 @@ def update_user_settings_data(
 						view_filter[filter_dict[fieldname]] = new
 						update = True
 		if update:
-			frappe.db.sql(
-				"update __UserSettings set data=%s where doctype=%s and user=%s",
-				(json.dumps(data), user_setting.doctype, user_setting.user),
-			)
+			__UserSettings = Table("__UserSettings")
+			frappe.qb.update(__UserSettings).set("data", json.dumps(data)).where(
+				__UserSettings.doctype == user_setting.doctype
+			).where(__UserSettings.user == user_setting.user).run()
 
 			# clear that user settings from the redis cache
 			frappe.cache.hset("_user_settings", f"{user_setting.doctype}::{user_setting.user}", None)

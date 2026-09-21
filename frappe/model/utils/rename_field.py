@@ -5,6 +5,8 @@ import json
 import frappe
 from frappe.model import no_value_fields, table_fields
 from frappe.model.utils.user_settings import sync_user_settings, update_user_settings_data
+from frappe.query_builder import Table
+from frappe.query_builder.functions import IfNull
 from frappe.utils.password import rename_password_field
 
 
@@ -26,22 +28,26 @@ def rename_field(doctype, old_fieldname, new_fieldname, validate=True):
 
 	if new_field.fieldtype in table_fields:
 		# change parentfield of table mentioned in options
-		frappe.db.sql(
-			"""update `tab{}` set parentfield={}
-			where parentfield={}""".format(new_field.options.split("\n", 1)[0], "%s", "%s"),
-			(new_fieldname, old_fieldname),
-		)
+		child = frappe.qb.DocType(new_field.options.split("\n", 1)[0])
+		(
+			frappe.qb.update(child)
+			.set("parentfield", new_fieldname)
+			.where(child.parentfield == old_fieldname)
+		).run()
 
 	elif new_field.fieldtype not in no_value_fields:
 		if meta.issingle:
-			frappe.db.sql(
-				"""update `tabSingles` set field=%s
-				where doctype=%s and field=%s""",
-				(new_fieldname, doctype, old_fieldname),
-			)
+			singles = Table("Singles")
+			(
+				frappe.qb.update(singles)
+				.set("field", new_fieldname)
+				.where(singles.doctype == doctype)
+				.where(singles.field == old_fieldname)
+			).run()
 		else:
 			# copy field value
-			frappe.db.sql(f"""update `tab{doctype}` set `{new_fieldname}`=`{old_fieldname}`""")
+			dt = frappe.qb.DocType(doctype)
+			frappe.qb.update(dt).set(dt[new_fieldname], dt[old_fieldname]).run()
 
 		update_reports(doctype, old_fieldname, new_fieldname)
 		update_users_report_view_settings(doctype, old_fieldname, new_fieldname)
@@ -74,13 +80,15 @@ def update_reports(doctype, old_fieldname, new_fieldname):
 
 		return sort_by
 
-	reports = frappe.db.sql(
-		"""select name, ref_doctype, json from tabReport
-		where report_type = 'Report Builder' and ifnull(is_standard, 'No') = 'No'
-		and json like %s and json like %s""",
-		("%{}%".format(old_fieldname), "%{}%".format(doctype)),
-		as_dict=True,
-	)
+	Report = frappe.qb.DocType("Report")
+	reports = (
+		frappe.qb.from_(Report)
+		.select(Report.name, Report.ref_doctype, Report.json)
+		.where(Report.report_type == "Report Builder")
+		.where(IfNull(Report.is_standard, "No") == "No")
+		.where(Report.json.like(f"%{old_fieldname}%"))
+		.where(Report.json.like(f"%{doctype}%"))
+	).run(as_dict=True)
 
 	for r in reports:
 		report_dict = json.loads(r.json)
@@ -121,14 +129,16 @@ def update_reports(doctype, old_fieldname, new_fieldname):
 				}
 			)
 
-			frappe.db.sql("""update `tabReport` set `json`=%s where name=%s""", (new_val, r.name))
+			frappe.qb.update(Report).set("json", new_val).where(Report.name == r.name).run()
 
 
 def update_users_report_view_settings(doctype, ref_fieldname, new_fieldname):
-	user_report_cols = frappe.db.sql(
-		"""select defkey, defvalue from `tabDefaultValue` where
-		defkey like '_list_settings:%'"""
-	)
+	DefaultValue = frappe.qb.DocType("DefaultValue")
+	user_report_cols = (
+		frappe.qb.from_(DefaultValue)
+		.select(DefaultValue.defkey, DefaultValue.defvalue)
+		.where(DefaultValue.defkey.like("_list_settings:%"))
+	).run()
 	for key, value in user_report_cols:
 		new_columns = []
 		columns_modified = False
@@ -140,37 +150,40 @@ def update_users_report_view_settings(doctype, ref_fieldname, new_fieldname):
 				new_columns.append([field, field_doctype])
 
 		if columns_modified:
-			frappe.db.sql(
-				"""update `tabDefaultValue` set defvalue={}
-				where defkey={}""".format("%s", "%s"),
-				(json.dumps(new_columns), key),
-			)
+			frappe.qb.update(DefaultValue).set("defvalue", json.dumps(new_columns)).where(
+				DefaultValue.defkey == key
+			).run()
 
 
 def update_property_setters(doctype, old_fieldname, new_fieldname):
-	frappe.db.sql(
-		"""update `tabProperty Setter` set field_name = %s
-		where doc_type=%s and field_name=%s""",
-		(new_fieldname, doctype, old_fieldname),
-	)
+	PropertySetter = frappe.qb.DocType("Property Setter")
+	(
+		frappe.qb.update(PropertySetter)
+		.set("field_name", new_fieldname)
+		.where(PropertySetter.doc_type == doctype)
+		.where(PropertySetter.field_name == old_fieldname)
+	).run()
 
-	frappe.db.sql(
-		"""update `tabCustom Field` set insert_after=%s
-		where insert_after=%s and dt=%s""",
-		(new_fieldname, old_fieldname, doctype),
-	)
+	CustomField = frappe.qb.DocType("Custom Field")
+	(
+		frappe.qb.update(CustomField)
+		.set("insert_after", new_fieldname)
+		.where(CustomField.insert_after == old_fieldname)
+		.where(CustomField.dt == doctype)
+	).run()
 
 
 def update_user_settings(doctype, old_fieldname, new_fieldname):
 	# store the user settings data from the redis to db
 	sync_user_settings()
 
-	user_settings = frappe.db.sql(
-		""" select user, doctype, data from `__UserSettings`
-		where doctype=%s and data like %s""",
-		(doctype, f"%{old_fieldname}%"),
-		as_dict=1,
-	)
+	__UserSettings = Table("__UserSettings")
+	user_settings = (
+		frappe.qb.from_(__UserSettings)
+		.select(__UserSettings.user, __UserSettings.doctype, __UserSettings.data)
+		.where(__UserSettings.doctype == doctype)
+		.where(__UserSettings.data.like(f"%{old_fieldname}%"))
+	).run(as_dict=True)
 
 	for user_setting in user_settings:
 		update_user_settings_data(user_setting, "docfield", old_fieldname, new_fieldname)

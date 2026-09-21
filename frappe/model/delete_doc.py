@@ -535,15 +535,14 @@ def clear_references(
 	reference_doctype_field="reference_doctype",
 	reference_name_field="reference_name",
 ):
-	frappe.db.sql(
-		f"""update
-			`tab{doctype}`
-		set
-			{reference_doctype_field}=NULL, {reference_name_field}=NULL
-		where
-			{reference_doctype_field}=%s and {reference_name_field}=%s""",  # nosec
-		(reference_doctype, reference_name),
-	)
+	ref_table = DocType(doctype)
+	(
+		frappe.qb.update(ref_table)
+		.set(reference_doctype_field, None)
+		.set(reference_name_field, None)
+		.where(ref_table[reference_doctype_field] == reference_doctype)
+		.where(ref_table[reference_name_field] == reference_name)
+	).run()
 
 
 def clear_timeline_references(link_doctype, link_name):

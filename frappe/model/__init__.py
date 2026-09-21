@@ -204,11 +204,13 @@ def delete_fields(args_dict, delete=0):
 			if frappe.db.db_type == "mariadb":
 				# mariadb implicitly commits before DDL, make it explicit
 				frappe.db.commit()
-
-			query = "ALTER TABLE `tab{}` ".format(dt) + ", ".join(
-				"DROP COLUMN `{}`".format(f) for f in fields_need_to_delete
-			)
-			frappe.db.sql(query)
+				query = "ALTER TABLE `tab{}` ".format(dt) + ", ".join(
+					"DROP COLUMN `{}`".format(f) for f in fields_need_to_delete
+				)
+				frappe.db.sql(query)
+			elif frappe.db.db_type == "surrealdb":
+				# SurrealDB has no ALTER TABLE DROP COLUMN; route through the backend
+				frappe.db.drop_columns(dt, list(fields_need_to_delete))
 
 		if frappe.db.db_type == "postgres":
 			# commit the results to db

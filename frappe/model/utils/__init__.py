@@ -29,11 +29,13 @@ def set_default(doc, key):
 	if not doc.is_default:
 		frappe.db.set(doc, "is_default", 1)
 
-	frappe.db.sql(
-		"""update `tab{}` set `is_default`=0
-		where `{}`={} and name!={}""".format(doc.doctype, key, "%s", "%s"),
-		(doc.get(key), doc.name),
-	)
+	dt = frappe.qb.DocType(doc.doctype)
+	(
+		frappe.qb.update(dt)
+		.set("is_default", 0)
+		.where(dt[key] == doc.get(key))
+		.where(dt.name != doc.name)
+	).run()
 
 
 def set_field_property(filters, key, value):
