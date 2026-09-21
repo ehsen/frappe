@@ -31,6 +31,7 @@ from frappe.utils import (
 	compare,
 	cstr,
 	flt,
+	get_table_name,
 	is_a_property,
 	now,
 	sanitize_html,
@@ -763,21 +764,30 @@ class BaseDocument:
 
 		columns = list(d)
 		try:
-			name = frappe.db.sql(
-				"""INSERT INTO `tab{doctype}` ({columns})
-					VALUES ({values}) {conflict_handler} {returning}""".format(
-					doctype=self.doctype,
-					columns=", ".join("`" + c + "`" for c in columns),
-					values=", ".join(["%s"] * len(columns)),
-					conflict_handler=conflict_handler,
-					returning=returning,
-				),
-				list(d.values()),
-			)
-			if (
-				frappe.db.db_type == "postgres" and self.meta.autoname == "hash" and not name
-			):  # To avoid a transaction block, we regen in try (pg specific)
-				return self._handle_hash_conflict()
+			if frappe.db.db_type == "surrealdb":
+				# SurrealDB: the driver understands only SurrealQL, so the insert is built through the qb
+				# layer (ADR 0003) instead of the raw SQL below. `ignore` renders INSERT IGNORE; a hash
+				# collision raises the mapped `1062 ... for key 'PRIMARY'` and is handled below like MariaDB.
+				query = frappe.qb.into(frappe.qb.DocType(self.doctype)).columns(*columns).insert(tuple(d.values()))
+				if (ignore_if_duplicate or self.meta.autoname == "hash") and (self.flags.retry_count or 0) < 5:
+					query = query.ignore()
+				query.run()
+			else:
+				name = frappe.db.sql(
+					"""INSERT INTO `tab{doctype}` ({columns})
+						VALUES ({values}) {conflict_handler} {returning}""".format(
+						doctype=self.doctype,
+						columns=", ".join("`" + c + "`" for c in columns),
+						values=", ".join(["%s"] * len(columns)),
+						conflict_handler=conflict_handler,
+						returning=returning,
+					),
+					list(d.values()),
+				)
+				if (
+					frappe.db.db_type == "postgres" and self.meta.autoname == "hash" and not name
+				):  # To avoid a transaction block, we regen in try (pg specific)
+					return self._handle_hash_conflict()
 		except Exception as e:
 			if frappe.db.is_primary_key_violation(e):
 				if self.meta.autoname == "hash":
@@ -819,13 +829,21 @@ class BaseDocument:
 		columns = list(d)
 
 		try:
-			frappe.db.sql(
-				"""UPDATE `tab{doctype}`
-				SET {values} WHERE `name`=%s""".format(
-					doctype=self.doctype, values=", ".join("`" + c + "`=%s" for c in columns)
-				),
-				[*list(d.values()), name],
-			)
+			if frappe.db.db_type == "surrealdb":
+				# SurrealDB: the raw SQL below is MariaDB/PG dialect — build the update through the qb layer
+				dt = frappe.qb.DocType(self.doctype)
+				query = frappe.qb.update(dt)
+				for column, value in d.items():
+					query = query.set(column, value)
+				query.where(dt.name == name).run()
+			else:
+				frappe.db.sql(
+					"""UPDATE `tab{doctype}`
+					SET {values} WHERE `name`=%s""".format(
+						doctype=self.doctype, values=", ".join("`" + c + "`=%s" for c in columns)
+					),
+					[*list(d.values()), name],
+				)
 
 		except Exception as e:
 			if frappe.db.is_data_too_long(e):
@@ -855,7 +873,9 @@ class BaseDocument:
 				doc.db_update()
 
 	def show_unique_validation_message(self, e):
-		if frappe.db.db_type == "mariadb":
+		if frappe.db.db_type in ("mariadb", "surrealdb"):
+			# both raise duplicates as (code, message) args; the SurrealDB backend maps them to the
+			# same MariaDB-shaped 1062 `Duplicate entry` message (see database/surrealdb/errors.py)
 			fieldname = str(e).split("'")[-2]
 			label = None
 
@@ -885,6 +905,16 @@ class BaseDocument:
 		Return:
 		        str: The column name associated with the key.
 		"""
+		if frappe.db.db_type == "surrealdb":
+			# SurrealDB: no SHOW INDEX — the unique-index names are preserved, read the mapping from the
+			# driver's table schema (same source the duplicate errors name the key after)
+			from frappe.database.surrealdb.schema import table_schema
+
+			for ix in table_schema(get_table_name(self.doctype)).indexes.values():
+				if ix["unique"] and ix["name"] == key_name and ix["fields"]:
+					return ix["fields"][0]
+			raise IndexError(key_name)
+
 		return frappe.db.sql(
 			f"""
 			SHOW

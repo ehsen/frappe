@@ -268,7 +268,8 @@ class Document(BaseDocument):
 			self._fix_numeric_types()
 
 		else:
-			if not is_doctype and isinstance(self.name, str | int):
+			# SurrealDB: the raw-SQL fast path below is MariaDB/PG dialect — take the qb-backed API path
+			if not is_doctype and isinstance(self.name, str | int) and frappe.db.db_type != "surrealdb":
 				for_update = ""
 				if self.flags.for_update and frappe.db.db_type != "sqlite":
 					for_update = "FOR UPDATE"
@@ -367,6 +368,17 @@ class Document(BaseDocument):
 		return self
 
 	def _load_child_table_from_db(self, fieldname, child_doctype):
+		if frappe.db.db_type == "surrealdb":
+			# SurrealDB: the raw-SQL fast path below is MariaDB/PG dialect — use the qb-backed API,
+			# same as the DocType bootstrap branch in load_children_from_db
+			return frappe.db.get_values(
+				child_doctype,
+				{"parent": str(self.name), "parenttype": self.doctype, "parentfield": fieldname},
+				"*",
+				as_dict=True,
+				order_by="idx asc",
+				for_update=self.flags.for_update,
+			)
 		for_update = ""
 		if self.flags.for_update and frappe.db.db_type != "sqlite":
 			for_update = "FOR UPDATE"
@@ -783,13 +795,19 @@ class Document(BaseDocument):
 			return
 
 		frappe.db.delete("Singles", {"doctype": self.doctype})
-		for field, value in d.items():
-			if field != "doctype":
-				frappe.db.sql(
-					"""insert into `tabSingles` (doctype, field, value)
-					values (%s, %s, %s)""",
-					(self.doctype, field, value),
-				)
+		if frappe.db.db_type == "surrealdb":
+			# SurrealDB: the per-row INSERT below is MariaDB/PG dialect — one qb batch insert instead
+			rows = [(self.doctype, field, value) for field, value in d.items() if field != "doctype"]
+			if rows:
+				frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*rows).run()
+		else:
+			for field, value in d.items():
+				if field != "doctype":
+					frappe.db.sql(
+						"""insert into `tabSingles` (doctype, field, value)
+						values (%s, %s, %s)""",
+						(self.doctype, field, value),
+					)
 
 		if self.doctype in frappe.db.value_cache:
 			frappe.db.value_cache.pop(self.doctype, None)
