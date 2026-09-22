@@ -64,6 +64,20 @@ def update_nsm(doc):
 	doc.reload()
 
 
+def _shift_matched_rows(doctype, filters, sets):
+	"""P2.1: a table-range UPDATE with a self-referential arithmetic SET
+	(`SET rgt = rgt + 2 WHERE rgt >= right`) hangs the SurrealDB server
+	(repro'd via the root CLI). Matched rows are read flat with a SELECT
+	(reads are safe) and shifted per record instead.
+	"""
+	Table = DocType(doctype)
+	for name in frappe.get_all(doctype, filters=filters, pluck="name", limit_page_length=0):
+		query = frappe.qb.update(Table)
+		for column, value in sets.items():
+			query = query.set(getattr(Table, column), value)
+		query.where(Table.name == name).run()
+
+
 def update_add_node(doc, parent, parent_field):
 	"""
 	insert a new node
@@ -86,9 +100,9 @@ def update_add_node(doc, parent, parent_field):
 
 	right = right or 1
 
-	# update all on the right
-	frappe.qb.update(Table).set(Table.rgt, Table.rgt + 2).where(Table.rgt >= right).run()
-	frappe.qb.update(Table).set(Table.lft, Table.lft + 2).where(Table.lft >= right).run()
+	# update all on the right (P2.1: per-record shifts, see _shift_matched_rows)
+	_shift_matched_rows(doctype, {"rgt": [">=", right]}, {"rgt": Table.rgt + 2})
+	_shift_matched_rows(doctype, {"lft": [">=", right]}, {"lft": Table.lft + 2})
 
 	if frappe.qb.from_(Table).select("*").where((Table.lft == right) | (Table.rgt == right + 1)).run():
 		frappe.throw(_("Nested set error. Please contact the Administrator."))
@@ -113,21 +127,21 @@ def update_move_node(doc: Document, parent_field: str):
 
 		validate_loop(doc.doctype, doc.name, new_parent.lft, new_parent.rgt)
 
-	# move to dark side
-	frappe.qb.update(Table).set(Table.lft, -Table.lft).set(Table.rgt, -Table.rgt).where(
-		(Table.lft >= doc.lft) & (Table.rgt <= doc.rgt)
-	).run()
+	# move to dark side (P2.1: per-record shifts, see _shift_matched_rows)
+	_shift_matched_rows(
+		doc.doctype,
+		[["lft", ">=", doc.lft], ["rgt", "<=", doc.rgt]],
+		{"lft": -Table.lft, "rgt": -Table.rgt},
+	)
 
 	# shift left
 	diff = doc.rgt - doc.lft + 1
-	frappe.qb.update(Table).set(Table.lft, Table.lft - diff).set(Table.rgt, Table.rgt - diff).where(
-		Table.lft > doc.rgt
-	).run()
+	_shift_matched_rows(doc.doctype, {"lft": [">", doc.rgt]}, {"lft": Table.lft - diff, "rgt": Table.rgt - diff})
 
 	# shift left rgts of ancestors whose only rgts must shift
-	frappe.qb.update(Table).set(Table.rgt, Table.rgt - diff).where(
-		(Table.lft < doc.lft) & (Table.rgt > doc.rgt)
-	).run()
+	_shift_matched_rows(
+		doc.doctype, [["lft", "<", doc.lft], ["rgt", ">", doc.rgt]], {"rgt": Table.rgt - diff}
+	)
 
 	if parent:
 		# re-query value due to computation above
@@ -143,14 +157,16 @@ def update_move_node(doc: Document, parent_field: str):
 		frappe.qb.update(Table).set(Table.rgt, Table.rgt + diff).where(Table.name == parent).run()
 
 		# shift right at new parent
-		frappe.qb.update(Table).set(Table.lft, Table.lft + diff).set(Table.rgt, Table.rgt + diff).where(
-			Table.lft > new_parent.rgt
-		).run()
+		_shift_matched_rows(
+			doc.doctype, {"lft": [">", new_parent.rgt]}, {"lft": Table.lft + diff, "rgt": Table.rgt + diff}
+		)
 
 		# shift right rgts of ancestors whose only rgts must shift
-		frappe.qb.update(Table).set(Table.rgt, Table.rgt + diff).where(
-			(Table.lft < new_parent.lft) & (Table.rgt > new_parent.rgt)
-		).run()
+		_shift_matched_rows(
+			doc.doctype,
+			[["lft", "<", new_parent.lft], ["rgt", ">", new_parent.rgt]],
+			{"rgt": Table.rgt + diff},
+		)
 
 		new_diff = new_parent.rgt - doc.lft
 	else:
@@ -159,9 +175,7 @@ def update_move_node(doc: Document, parent_field: str):
 		new_diff = max_rgt + 1 - doc.lft
 
 	# bring back from dark side
-	frappe.qb.update(Table).set(Table.lft, -Table.lft + new_diff).set(Table.rgt, -Table.rgt + new_diff).where(
-		Table.lft < 0
-	).run()
+	_shift_matched_rows(doc.doctype, {"lft": ["<", 0]}, {"lft": -Table.lft + new_diff, "rgt": -Table.rgt + new_diff})
 
 
 @frappe.whitelist()
@@ -255,9 +269,10 @@ def remove_subtree(doctype: str, name: str, throw=True):
 
 	# All `lft` and `rgt` values, that are greater than the `rgt` of the removed
 	# subtree, must be reduced by the width of the subtree.
-	table = frappe.qb.DocType(doctype)
-	frappe.qb.update(table).set(table.lft, table.lft - width).where(table.lft > rgt).run()
-	frappe.qb.update(table).set(table.rgt, table.rgt - width).where(table.rgt > rgt).run()
+	# (P2.1: per-record shifts, see _shift_matched_rows)
+	Table = DocType(doctype)
+	_shift_matched_rows(doctype, {"lft": [">", rgt]}, {"lft": Table.lft - width})
+	_shift_matched_rows(doctype, {"rgt": [">", rgt]}, {"rgt": Table.rgt - width})
 
 	frappe.clear_document_cache(doctype)
 
@@ -376,17 +391,28 @@ class NestedSet(Document):
 
 
 def get_root_of(doctype):
-	"""Get root element of a DocType with a tree structure"""
-	from frappe.query_builder.functions import Count
+	"""Get root element of a DocType with a tree structure
 
-	Table = DocType(doctype)
-	t1 = Table.as_("t1")
-	t2 = Table.as_("t2")
+	P2.1: the correlated Count subquery (`node_query == 0`) is a P1.6 gap;
+	the root (a node with no proper ancestor and a non-empty lft/rgt) is
+	found over a flat single-table read stitched in Python.
+	"""
+	rows = frappe.get_all(doctype, fields=["name", "lft", "rgt"])
+	for row in rows:
+		lft, rgt = row["lft"], row["rgt"]
+		if lft is None or rgt is None or not rgt > lft:
+			continue
+		has_ancestor = any(
+			other["lft"] is not None
+			and other["rgt"] is not None
+			and other["lft"] < lft
+			and other["rgt"] > rgt
+			for other in rows
+		)
+		if not has_ancestor:
+			return row["name"]
 
-	node_query = SubQuery(frappe.qb.from_(t2).select(Count("*")).where((t2.lft < t1.lft) & (t2.rgt > t1.rgt)))
-	result = frappe.qb.from_(t1).select(t1.name).where((node_query == 0) & (t1.rgt > t1.lft)).run()
-
-	return result[0][0] if result else None
+	return None
 
 
 def get_ancestors_of(doctype, name, order_by="lft desc", limit=None):

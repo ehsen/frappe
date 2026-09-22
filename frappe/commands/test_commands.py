@@ -591,6 +591,13 @@ class TestCommands(BaseTestCommands):
 
 			root_conn = get_root_connection()
 			root_conn.sql(f"CREATE USER '{user}'@'localhost'")
+		elif frappe.conf.db_type == "surrealdb":
+			# SurrealDB users are database-scoped: the database does not exist yet, so there is nothing
+			# to pre-create here (the upstream postgres-shaped else-branch would reach the SurrealDB
+			# server through frappe.database.get_db with the MariaDB-style root credentials and
+			# `cur_db_name=root`, failing 1045). setup_database provisions `db_user` on the new
+			# database instead; the assertions below check exactly that.
+			pass
 		else:
 			from frappe.database.postgres.setup_db import get_root_connection
 

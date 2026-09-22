@@ -150,6 +150,10 @@ def get_desktop_icons(user=None, bootinfo=None):
 
 		DesktopIcon = DocType("Desktop Icon")
 
+		# P2.1: dropped the redundant .distinct() — name is in the select list so
+		# each record appears once; the translator maps DISTINCT to GROUP BY all
+		# selected columns and long-text columns (icon_image, link) cannot be
+		# group keys (P1.6).
 		user_icons = (
 			frappe.qb.from_(DesktopIcon)
 			.select(*fields)
@@ -160,7 +164,6 @@ def get_desktop_icons(user=None, bootinfo=None):
 					& (DesktopIcon.owner.isin(["Administrator", frappe.session.user]))
 				)
 			)
-			.distinct()
 		).run(as_dict=True)
 
 		# sort by idx

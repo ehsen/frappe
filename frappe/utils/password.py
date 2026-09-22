@@ -54,7 +54,14 @@ def set_encrypted_password(doctype, name, pwd, fieldname="password"):
 	)
 
 	# TODO: Simplify this via aliasing methods in `frappe.qb`
-	if frappe.db.db_type == "mariadb":
+	# patch_set_encrypted_password (official-run blocker #4)
+	if frappe.db.db_type == "surrealdb":
+		# INSERT with VALUES + upsert on (doctype, name, fieldname); mirrors update_password.
+		enc = encrypt(pwd)
+		query = query.insert(doctype, name, fieldname, enc, 1).on_duplicate_key_update(
+			Auth.password, enc
+		)
+	elif frappe.db.db_type == "mariadb":
 		query = query.insert(doctype, name, fieldname, encrypt(pwd), 1).on_duplicate_key_update(
 			Auth.password, Values(Auth.password)
 		)
@@ -142,6 +149,13 @@ def update_password(user, pwd, doctype="User", fieldname="password", logout_all_
 		)
 	elif frappe.db.db_type == "sqlite":
 		query = query.insert_or_replace(doctype, user, fieldname, hashPwd, 0)
+
+	elif frappe.db.db_type == "surrealdb":
+		query = (
+			query.insert(doctype, user, fieldname, hashPwd, 0)
+			.on_duplicate_key_update(Auth.password, hashPwd)
+			.on_duplicate_key_update(Auth.encrypted, 0)
+		)
 
 	elif frappe.db.db_type == "postgres":
 		query = (

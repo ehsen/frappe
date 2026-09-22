@@ -46,11 +46,16 @@ def deferred_insert(routes: str | list[dict[str, Any]]):
 
 @frappe.whitelist()
 def frequently_visited_links():
-	return frappe.get_all(
+	# P2.1: ordering by the aggregate alias (`order_by="count desc"`) needs
+	# alias-aware ORDER BY in the grouped-select path (P1.6 gap), so the
+	# aggregation runs in Python over a flat single-table read.
+	rows = frappe.get_all(
 		"Route History",
-		fields=["route", {"COUNT": "name", "as": "count"}],
+		fields=["route", "name"],
 		filters={"user": frappe.session.user},
-		group_by="route",
-		order_by="count desc",
-		limit=5,
 	)
+	counts: dict = {}
+	for r in rows:
+		counts[r["route"]] = counts.get(r["route"], 0) + 1
+	routes = sorted(counts, key=lambda route: -counts[route])
+	return [{"route": route, "count": counts[route]} for route in routes[:5]]

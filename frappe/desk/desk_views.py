@@ -179,65 +179,103 @@ class DeskViews:
 		def exclude_disabled_reports(query):
 			return query.where(report.disabled == 0) if is_report else query
 
-		# get pages or reports set on custom role
-		pages_with_custom_roles = exclude_disabled_reports(
+		role_field = parent.lower()
+
+		# P2.1: the original comma-joins (customRole x hasRole x parentTable) and
+		# the correlated Count subquery are P1.6 gaps in the SurrealQL translator
+		# (a SELECT must have exactly one table), so the joins run as sequential
+		# single-table qb reads stitched together in Python below.
+
+		# role-matched Has Role parents (any parenttype; later steps scope the use)
+		if roles:
+			role_matched = (
+				frappe.qb.from_(hasRole)
+				.select(hasRole.parent)
+				.distinct()
+				.where(hasRole.role.isin(roles))
+				.run(as_dict=True)
+			)
+		else:
+			role_matched = []
+		role_matched_parents = {r["parent"] for r in role_matched}
+
+		# every custom-role attachment (any role) — drives both the custom-role
+		# pass and the exclusion set the original notin(subq) encoded
+		custom_role_rows = (
 			frappe.qb.from_(customRole)
-			.from_(hasRole)
-			.from_(parentTable)
-			.select(
-				customRole[parent.lower()].as_("name"), customRole.modified, customRole.ref_doctype, *columns
-			)
-			.where(
-				(hasRole.parent == customRole.name)
-				& (parentTable.name == customRole[parent.lower()])
-				& (customRole[parent.lower()].isnotnull())
-				& (hasRole.role.isin(roles))
-			)
-		).run(as_dict=True)
+			.select(customRole.name, customRole.modified, customRole.ref_doctype, customRole[role_field])
+			.where(customRole[role_field].isnotnull())
+			.run(as_dict=True)
+		)
+		custom_attachments = {
+			cr["name"]: {
+				"modified": cr["modified"],
+				"ref_doctype": cr["ref_doctype"],
+				"entity": cr[role_field],
+			}
+			for cr in custom_role_rows
+		}
+		attached_entities = {info["entity"] for info in custom_attachments.values()}
+
+		# get pages or reports set on custom role
+		custom_by_entity = {}
+		for cr_name, info in custom_attachments.items():
+			if cr_name in role_matched_parents and info["entity"] not in custom_by_entity:
+				custom_by_entity[info["entity"]] = info
+
+		if custom_by_entity:
+			pages_with_custom_roles = exclude_disabled_reports(
+				frappe.qb.from_(parentTable)
+				.select(parentTable.name.as_("name"), parentTable.modified, *columns)
+				.where(parentTable.name.isin(list(custom_by_entity)))
+			).run(as_dict=True)
+		else:
+			pages_with_custom_roles = []
 
 		for p in pages_with_custom_roles:
-			has_role[p.name] = {"modified": p.modified, "title": p.title, "ref_doctype": p.ref_doctype}
+			info = custom_by_entity[p["name"]]
+			has_role[p["name"]] = {
+				"modified": info["modified"],
+				"title": p["title"],
+				"ref_doctype": info["ref_doctype"],
+			}
 
-		subq = (
-			frappe.qb.from_(customRole)
-			.select(customRole[parent.lower()])
-			.where(customRole[parent.lower()].isnotnull())
-		)
-
-		pages_with_standard_roles = exclude_disabled_reports(
-			frappe.qb.from_(hasRole)
-			.from_(parentTable)
-			.select(parentTable.name.as_("name"), parentTable.modified, *columns)
-			.where(
-				(hasRole.role.isin(roles))
-				& (hasRole.parent == parentTable.name)
-				& (parentTable.name.notin(subq))
-			)
-			.distinct()
-		).run(as_dict=True)
+		# standard-role paths: role-matched parents not attached via ANY custom role
+		standard_candidates = sorted(role_matched_parents - attached_entities)
+		if standard_candidates:
+			pages_with_standard_roles = exclude_disabled_reports(
+				frappe.qb.from_(parentTable)
+				.select(parentTable.name.as_("name"), parentTable.modified, *columns)
+				.where(parentTable.name.isin(standard_candidates))
+			).run(as_dict=True)
+		else:
+			pages_with_standard_roles = []
 
 		for p in pages_with_standard_roles:
-			if p.name not in has_role:
-				has_role[p.name] = {"modified": p.modified, "title": p.title}
+			if p["name"] not in has_role:
+				has_role[p["name"]] = {"modified": p["modified"], "title": p["title"]}
 				if parent == "Report":
-					has_role[p.name].update({"ref_doctype": p.ref_doctype})
-
-		no_of_roles = SubQuery(
-			frappe.qb.from_(hasRole).select(Count("*")).where(hasRole.parent == parentTable.name)
-		)
+					has_role[p["name"]].update({"ref_doctype": p["ref_doctype"]})
 
 		# pages and reports with no role are allowed
-		rows_with_no_roles = exclude_disabled_reports(
+		all_role_parent_rows = (
+			frappe.qb.from_(hasRole).select(hasRole.parent).distinct().run(as_dict=True)
+		)
+		parents_with_any_roles = sorted({r["parent"] for r in all_role_parent_rows})
+
+		no_role_query = (
 			frappe.qb.from_(parentTable)
-			.select(parentTable.name, parentTable.modified, *columns)
-			.where(no_of_roles == 0)
-		).run(as_dict=True)
+			.select(parentTable.name.as_("name"), parentTable.modified, *columns)
+		)
+		if parents_with_any_roles:
+			no_role_query = no_role_query.where(parentTable.name.notin(parents_with_any_roles))
+		rows_with_no_roles = exclude_disabled_reports(no_role_query).run(as_dict=True)
 
 		for r in rows_with_no_roles:
-			if r.name not in has_role:
-				has_role[r.name] = {"modified": r.modified, "title": r.title}
+			if r["name"] not in has_role:
+				has_role[r["name"]] = {"modified": r["modified"], "title": r["title"]}
 				if is_report:
-					has_role[r.name] |= {"ref_doctype": r.ref_doctype}
+					has_role[r["name"]] |= {"ref_doctype": r["ref_doctype"]}
 
 		if is_report:
 			if not has_permission("Report", user=user, print_logs=False):

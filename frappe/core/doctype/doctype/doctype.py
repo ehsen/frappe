@@ -32,7 +32,8 @@ from frappe.model.meta import Meta
 from frappe.modules import get_doc_path, make_boilerplate
 from frappe.modules.import_file import get_file_path
 from frappe.permissions import ALL_USER_ROLE, AUTOMATIC_ROLES, SYSTEM_USER_ROLE
-from frappe.query_builder.functions import Concat
+from frappe.query_builder import DocType as QBTable
+from frappe.query_builder.functions import Concat, Count
 from frappe.utils import cint, cstr, flt, get_datetime, is_a_property, random_string
 from frappe.website.utils import clear_cache
 
@@ -1473,13 +1474,21 @@ def validate_fields(meta: Meta):
 				)
 
 			if not d.get("__islocal") and frappe.db.has_column(d.parent, d.fieldname):
-				has_non_unique_values = frappe.db.sql(
-					f"""select `{d.fieldname}`, count(*)
-					from `tab{d.parent}` where ifnull(`{d.fieldname}`, '') != ''
-					group by `{d.fieldname}` having count(*) > 1 limit 1"""
+				# P2.1: the raw group-by check carried MariaDB ifnull(); rebuilt
+				# through qb (named read; P1.6).
+				_table = QBTable(d.parent)
+				_field = getattr(_table, d.fieldname)
+				has_non_unique_values = (
+					frappe.qb.from_(_table)
+					.select(_field, Count("*").as_("value_count"))
+					.where((_field.isnull()) | (_field == ""))
+					.groupby(_field)
+					.having(Count("*") > 1)
+					.limit(1)
+					.run(as_dict=1)
 				)
 
-				if has_non_unique_values and has_non_unique_values[0][0]:
+				if has_non_unique_values and has_non_unique_values[0][d.fieldname]:
 					frappe.throw(
 						_("{0}: Field '{1}' cannot be set as Unique as it has non-unique values").format(
 							docname, d.label

@@ -83,7 +83,11 @@ def get_countries_and_currencies():
 					symbol=country.currency_symbol,
 					fraction_units=country.currency_fraction_units,
 					smallest_currency_fraction_value=country.smallest_currency_fraction_value,
-					number_format=frappe.db.escape(country.number_format)[1:-1],
+					number_format=country.number_format
+				if frappe.db.db_type == "surrealdb"
+				# the doc insert binds the value; MariaDB's escape-and-unquote idiom is only
+				# meaningful for interpolated SQL, and the SurrealDB backend fails closed on it
+				else frappe.db.escape(country.number_format)[1:-1],
 				)
 			)
 

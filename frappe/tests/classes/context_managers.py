@@ -106,12 +106,18 @@ def change_settings(doctype, settings_dict=None, /, commit=False, **settings) ->
 def switch_site(site: str) -> None:
 	"""Temporarily: drop current connection and switch to a different site."""
 	old_site = frappe.local.site
-	frappe.init(site, force=True)
-	frappe.connect()
-	yield
-	frappe.destroy()
-	frappe.init(old_site, force=True)
-	frappe.connect()
+	try:
+		frappe.init(site, force=True)
+		frappe.connect()
+		yield
+	finally:
+		# Restore the previous site even when the switch or the body failed: without the
+		# `finally`, frappe.local stays bound to the (possibly broken) temp site's database
+		# and poisons every later test in the process (measured: the 2026-09-21 full-suite
+		# run's shard1 cascaded 1045s from one failed temp-site switch into ~210 errors).
+		frappe.destroy()
+		frappe.init(old_site, force=True)
+		frappe.connect()
 
 
 @UnitTestCase.registerAs(staticmethod)
