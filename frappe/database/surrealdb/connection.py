@@ -17,9 +17,11 @@ Rules fixed by measurement (docs/ENVIRONMENT.md "Driver findings", `spike/P1.3-d
   NOWAIT / SKIP LOCKED are built on application locks (`transactions.AppLock`: CAS on `__lock` records in
   autocommit, plus a fenced `__fence` write inside the unit of work) and the retry hooks in `frappe.app` /
   `frappe.utils.background_jobs` (ADR 0002, P0.7 prototype).
-* Values are bound as parameters, never interpolated. Only named (`$name`, dict) parameters exist; MariaDB-style
-  positional `%s` parameters are refused. Date/time values are refused too: ADR 0001 stores them as canonical
-  text / integers and the *translator*, which knows the column type, encodes them.
+* Values are bound as parameters, never interpolated. The translator and Frappe's qb layer bind named
+  (`$name`, dict) parameters; printf-style positional parameters (`%s`, pymysql's convention - used widely
+  by upstream frappe code and test_db) bind as `$pN` via `positional_to_named`, with temporal values encoded
+  to their canonical form there (raw sql has no column context). *Named* temporal values are still refused:
+  ADR 0001 stores them as canonical text / integers and the *translator*, which knows the column type, encodes them.
 * The SDK is imported lazily so that MariaDB sites never need it (it is an optional dependency).
 
 Frappe's `Database.sql()` talks to a DB-API cursor; `SurrealCursor` is the small adapter that lets the upstream
@@ -30,21 +32,28 @@ import datetime
 import decimal
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from frappe.database.surrealdb.errors import (
 	CR_SERVER_GONE,
+	ER_ACCESS_DENIED,
+	ER_READONLY,
+	SurrealDBAuthError,
 	SurrealDBConnectionError,
 	SurrealDBError,
 	SurrealDBIntegrityError,
+	SurrealDBOperationalError,
 	SurrealDBProgrammingError,
 	SurrealDBTransactionConflict,
 	classify_exception,
 	classify_rpc_error,
 	classify_statement_error,
 )
+from frappe.database.surrealdb.values import to_date, to_datetime, to_time_us
 from frappe.database.surrealdb.transactions import (
 	DEFAULT_LOCK_TIMEOUT,
 	DEFAULT_LOCK_TTL,
@@ -145,6 +154,85 @@ def encode_params(params) -> dict:
 	return {str(k): encode_value(v) for k, v in params.items()}
 
 
+_POSITIONAL_PARAM = re.compile(r"%(?:(\((\w+)\))([sd])|([sd])|%%|(%\S)?)")
+
+
+def _bind_positional(value: Any) -> Any:
+	"""Encode a temporal positional parameter to its canonical form (ADR 0001 point 8) - the
+	translator does the same for literals. Zero microseconds are trimmed like pymysql's escape."""
+	if isinstance(value, datetime.datetime):
+		text = to_datetime(value)
+		return text[:19] if text.endswith(".000000") else text
+	if isinstance(value, datetime.date):
+		return to_date(value)
+	if isinstance(value, datetime.timedelta):
+		return to_time_us(value)
+	return value
+
+
+def positional_to_named(query: str, params) -> tuple[str, Any]:
+	"""Bind printf-style positional parameters (`%s`, pymysql's convention - upstream frappe code and
+	test_db rely on them) as named `$pN` parameters: every value stays bound, never interpolated into
+	the text (P1.3). `%(name)s` takes a dict of values; the `%d` form must convert to an integer;
+	anything else printf-like fails closed. A `select <expr>` without FROM - which SurrealQL has no
+	meaning for - is rendered as `RETURN <expr>` (MariaDB's `SELECT expr` shape)."""
+	if params is None or isinstance(params, dict):
+		return _fromless_select(query), params
+	if not isinstance(params, (list, tuple)):
+		params = (params,)
+	if not params:
+		return _fromless_select(query), {}
+	bound: dict[str, Any] = {}
+	index = 0
+
+	def substitute(m: "re.Match") -> str:
+		nonlocal index
+		if m[0] == "%%":
+			return "%"
+		if m[1] is not None:
+			raise SurrealDBProgrammingError(
+				0,
+				"Named printf parameters (`%(name)s`) take a dict of values, not a positional "
+				"sequence; bind them as a `$name` dict instead.",
+			)
+		try:
+			value = _bind_positional(params[index])
+		except IndexError as e_:
+			raise SurrealDBProgrammingError(
+				0, f"Not enough positional parameters for {query.count('%s')} placeholder(s) in the query."
+			) from e_
+		if m[4] == "d":
+			try:
+				value = int(value)
+			except (TypeError, ValueError) as e_:
+				raise SurrealDBProgrammingError(0, f"`%d` needs an integer, got {value!r}") from e_
+		name = f"p{index}"
+		bound[name] = value
+		index += 1
+		return f"${name}"
+
+	text = _POSITIONAL_PARAM.sub(substitute, query)
+	if index == 0:
+		# printf-formatted text without placeholders and values passed: pymysql fails the same way
+		raise SurrealDBProgrammingError(
+			0,
+			"Positional parameters were passed for a query without `%s` placeholders "
+			"(MariaDB's driver rejects this too).",
+		)
+	return _fromless_select(text), bound
+
+
+def _fromless_select(query: str) -> str:
+	"""`select <expr>` with no FROM (SurrealQL has no such form) renders as `RETURN <expr>`,
+	which returns the single value MariaDB's `SELECT expr` row would have."""
+	if not isinstance(query, str):
+		return query
+	m = re.match(r"(?is)(\s*select\b)(.*)$", query)
+	if m and not re.search(r"(?i)\bfrom\b", m[2]):
+		return "RETURN" + m[2]
+	return query
+
+
 def decode_value(value: Any) -> Any:
 	"""SDK value -> what Frappe expects. Decimal -> float (Frappe converts DECIMAL to float on read); the record `id`
 	column is dropped (ADR 0001: the driver returns `name`, never a parsed id) and any other record id becomes its
@@ -224,6 +312,12 @@ class SurrealConnection:
 		self._client = None
 		self._txn = None
 		self._lost = False
+		# MariaDB's `START TRANSACTION READ ONLY`: writes are rejected with ER_READONLY until
+		# commit/rollback; `SurrealDBExceptionUtil.is_read_only_mode_error` classifies the error.
+		self._read_only = False
+		# Serialise every websocket RPC: the SDK's blocking session matches responses
+		# by request id and breaks ("Response ID mismatch") when two calls overlap.
+		self._rpc_lock = threading.Lock()
 		# Unit of work (ADR 0002): successful write statements for replay / savepoints, held app locks,
 		# the auto-retry gate and metrics.
 		self._log: list[tuple[str, dict]] = []  # successful write statements (whole script, bound params)
@@ -260,7 +354,16 @@ class SurrealConnection:
 			client.use(p.namespace, p.database or ADMIN_DATABASE)
 		except Exception as e:
 			self._close_quietly(client)
-			raise classify_exception(e) from e
+			err = classify_exception(e)
+			if isinstance(err, SurrealDBAuthError):
+				# MariaDB-shaped connect failure: frappe/tests/test_db.py parses `Access denied for ...`
+				# and the database name out of the message.
+				host = urlsplit(p.url).hostname or p.url
+				err = SurrealDBAuthError(
+					ER_ACCESS_DENIED,
+					f"Access denied for user '{p.username}' at '{host}'; database \"{p.database}\"",
+				)
+			raise err from e
 		self._client = client
 		self._txn = None
 		self._lost = False
@@ -334,8 +437,10 @@ class SurrealConnection:
 	def commit(self):
 		"""Commit the unit of work. On an optimistic conflict the transaction is already rolled back on the
 		server: release the locks, forget the unit and raise (the retry hooks re-run the unit, ADR 0002)."""
+		self._read_only = False  # the flag ends with the unit even when no transaction was opened (lazy begin)
 		if self._txn is None:
 			return
+		self._read_only = False
 		txn, self._txn = self._txn, None
 		try:
 			self._call(self._client.commit, txn)
@@ -350,11 +455,17 @@ class SurrealConnection:
 		self._reset_unit()
 
 	def rollback(self):
+		self._read_only = False
 		txn, self._txn = self._txn, None
 		if txn is not None:
 			self._call(self._client.cancel, txn)
 		self._release_locks_quietly()
 		self._reset_unit()
+
+	def set_read_only_mode(self, flag: bool):
+		"""Track MariaDB's `START TRANSACTION READ ONLY`: write statements are rejected with an
+		ER_READONLY error until the next commit/rollback (which clear the flag again)."""
+		self._read_only = bool(flag)
 
 	# --- savepoints (statement-log marks; SurrealDB has no SAVEPOINT syntax) -----------------------------------
 	def savepoint(self, name: str):
@@ -396,31 +507,33 @@ class SurrealConnection:
 
 	# --- raw execution ----------------------------------------------------------------------------------------
 	def _call(self, fn, *args, **kwargs):
-		try:
-			return fn(*args, **kwargs)
-		except Exception as e:
-			err = classify_exception(e)
-			if isinstance(err, SurrealDBConnectionError):
-				self._mark_lost()
-			raise err from e
+		with self._rpc_lock:
+			try:
+				return fn(*args, **kwargs)
+			except Exception as e:
+				err = classify_exception(e)
+				if isinstance(err, SurrealDBConnectionError):
+					self._mark_lost()
+				raise err from e
 
 	def _raw(self, query: str, bound: dict, txn_id) -> list:
 		"""One query text over the wire: RPC errors and every statement's status are classified."""
-		try:
-			raw = self._client.query_raw(query, bound, txn_id=txn_id)
-		except Exception as e:
-			err = classify_exception(e)
-			if isinstance(err, SurrealDBConnectionError):
-				self._mark_lost()
-			raise err from e
-		if raw.get("error"):
-			raise classify_rpc_error(raw["error"])
-		results = []
-		for statement in raw.get("result") or []:
-			if statement.get("status") != "OK":
-				raise classify_statement_error(statement.get("result"))
-			results.append(decode_value(statement.get("result")))
-		return results
+		with self._rpc_lock:
+			try:
+				raw = self._client.query_raw(query, bound, txn_id=txn_id)
+			except Exception as e:
+				err = classify_exception(e)
+				if isinstance(err, SurrealDBConnectionError):
+					self._mark_lost()
+				raise err from e
+			if raw.get("error"):
+				raise classify_rpc_error(raw["error"])
+			results = []
+			for statement in raw.get("result") or []:
+				if statement.get("status") != "OK":
+					raise classify_statement_error(statement.get("result"))
+				results.append(decode_value(statement.get("result")))
+			return results
 
 	def _autocommit_raw(self, query: str, params=None) -> list:
 		"""One statement in autocommit (its own transaction), never touching the unit of work."""
@@ -433,6 +546,7 @@ class SurrealConnection:
 		is restored by replaying the write log when a failure was not provably pre-write (module docstring).
 		Outside a transaction a multi-statement script is *not* atomic (SurrealDB behaviour) - callers that
 		need atomicity use a transaction."""
+		query, params = positional_to_named(query, params)
 		bound = encode_params(params)
 		self._require_open()
 		self._maybe_heartbeat()
@@ -667,10 +781,18 @@ class SurrealCursor:
 	def execute(self, query: str, values=None):
 		self.description, self.rowcount, self._rows, self._pos = None, -1, (), 0
 		text = query.strip()
-		lowered = text.lower().rstrip(";").strip()
+		# Database.sql appends `/* FRAPPE_TRACE_ID: ... */`; strip block comments so the
+		# transaction-statement interception still matches (see patch_txn_comment.py, v2).
+		# `plain` keeps case (savepoint names are case-sensitive marks); `lowered` only drives matching.
+		plain = re.sub(r"/\*.*?\*/", " ", text, flags=re.S).rstrip(";").strip()
+		lowered = plain.lower()
 		# Frappe drives transactions with SQL text (Database.begin/commit/rollback/savepoint)
 		if lowered.startswith(("start transaction", "begin")):
-			return self.connection.begin()
+			# begin() first (it may implicitly commit a stale unit, which resets the read-only flag),
+			# then record the mode of the *new* unit
+			self.connection.begin()
+			self.connection.set_read_only_mode("read only" in lowered)
+			return None
 		if lowered in ("commit", "commit and chain"):
 			self.connection.commit()
 			return self.connection.begin() if lowered.endswith("chain") else None
@@ -678,18 +800,25 @@ class SurrealCursor:
 			self.connection.rollback()
 			return self.connection.begin() if lowered.endswith("chain") else None
 		if lowered.startswith("savepoint"):
-			self.connection.savepoint(lowered[len("savepoint") :].strip())
+			self.connection.savepoint(plain[len("savepoint") :].strip())
 			return None
 		if lowered.startswith("release savepoint"):
-			self.connection.release_savepoint(lowered[len("release savepoint") :].strip())
+			self.connection.release_savepoint(plain[len("release savepoint") :].strip())
 			return None
 		if lowered.startswith("rollback to"):
-			name = lowered[len("rollback to") :].strip()
+			name = plain[len("rollback to") :].strip()
 			if name.lower().startswith("savepoint"):
 				name = name[len("savepoint") :].strip()
 			self.connection.rollback_to(name)
 			return None
 
+		if self.connection._read_only and last_statement_word(text) in WRITE_STARTS:
+			# MariaDB rejects writes inside a READ ONLY transaction (ER 1792); the base Database
+			# classifies this error and raises frappe.InReadOnlyMode.
+			raise SurrealDBOperationalError(
+				ER_READONLY,
+				f"Cannot execute statement in a READ ONLY transaction: {text[:160]}",
+			)
 		hint = _COLUMNS_HINT.search(text)
 		columns = [c.strip() for c in hint[1].split(",")] if hint else None
 		kinds_hint = _KINDS_HINT.search(text)
@@ -699,9 +828,16 @@ class SurrealCursor:
 
 		lock_key, lock_rows = _LOCK_KEY_HINT.search(text), _LOCK_ROWS_HINT.search(text)
 		if lock_key is not None and lock_rows is None:
-			# lock the record before reading it: the read then sees the previous holder's commit
-			self._acquire_lock(lock_key[1], lock_key[2])
-			results = self.connection.execute(text, values)
+			if lock_key[1] == "s" and not (
+				self.connection.try_lock(lock_key[2]) or self.connection.holds(lock_key[2])
+			):
+				# MariaDB's SKIP LOCKED on a single record: it is locked by another transaction, so
+				# the read yields no rows at all (no wait, no 1205 error - the record is skipped).
+				results = []
+			else:
+				# lock the record before reading it: the read then sees the previous holder's commit
+				self._acquire_lock(lock_key[1], lock_key[2])
+				results = self.connection.execute(text, values)
 		elif lock_rows is not None:
 			# two-statement script: [ids to lock, the query itself]; re-read after the grants
 			mode, table = lock_rows[1], lock_rows[2]

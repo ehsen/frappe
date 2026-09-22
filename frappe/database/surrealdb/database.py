@@ -1,7 +1,10 @@
+import datetime
 import re
 
 import frappe
+from contextlib import contextmanager
 from frappe.database.database import Database
+from frappe.database.utils import Query, QueryValues
 from frappe.database.surrealdb import collation
 from frappe.database.surrealdb.connection import (
 	DEFAULT_NAMESPACE,
@@ -18,6 +21,7 @@ from frappe.database.surrealdb.errors import (
 	ER_LOCK_WAIT_TIMEOUT,
 	ER_NO_SUCH_TABLE,
 	ER_PARSE_ERROR,
+	ER_READONLY,
 	ER_STATEMENT_TIMEOUT,
 	SurrealDBConnectionError,
 	SurrealDBDataError,
@@ -42,9 +46,49 @@ from frappe.database.surrealdb.schema import (
 	quote,
 	quote_table,
 	system_table_statements,
+	table_schema,
+	table_schema_from_info,
 	unquote,
 )
 from frappe.utils import get_table_name
+
+
+def _display_values(values):
+	"""Log-display form of bound values: datetimes render as their MariaDB literal shape."""
+	if isinstance(values, dict):
+		return {k: _display_values(v) for k, v in values.items()}
+	if isinstance(values, (list, tuple)):
+		return [_display_values(v) for v in values]
+	if isinstance(values, (datetime.datetime, datetime.date, datetime.timedelta)):
+		return str(values)
+	return values
+
+
+def _split_top(text: str) -> list[str]:
+	"""Split on top-level commas (quotes and parentheses protected)."""
+	parts, buf, depth, quote = [], [], 0, None
+	for ch in text:
+		if quote:
+			buf.append(ch)
+			if ch == quote:
+				quote = None
+		elif ch in "'\"`":
+			quote = ch
+			buf.append(ch)
+		elif ch == "(":
+			depth += 1
+			buf.append(ch)
+		elif ch == ")":
+			depth -= 1
+			buf.append(ch)
+		elif ch == "," and depth == 0:
+			parts.append("".join(buf))
+			buf = []
+		else:
+			buf.append(ch)
+	if buf:
+		parts.append("".join(buf))
+	return parts
 
 
 def _code(e) -> int | None:
@@ -73,7 +117,9 @@ class SurrealDBExceptionUtil:
 
 	@staticmethod
 	def is_read_only_mode_error(e) -> bool:
-		return False
+		# `START TRANSACTION READ ONLY` writes are rejected with MariaDB's ER_READONLY shape
+		# (SurrealCursor); the base Database maps this to frappe.InReadOnlyMode.
+		return _code(e) == ER_READONLY
 
 	@staticmethod
 	def is_table_missing(e) -> bool:
@@ -208,8 +254,96 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		return super().sql(*args, as_dict=as_dict, **kwargs)
 
 	def execute_query(self, query, values=None):
-		self._cursor.require_order = getattr(self, "_require_order", True)
+		# NOTE: the order matters - the hint paths recurse into sql()/execute_query() (as_dict INFO
+		# reads) which reset `self._require_order` and the cursor flag; the flag captured below reflects
+		# THIS call's consumer and is applied to the cursor after the recursion.
+		require_order = getattr(self, "_require_order", True)
+		query = self._order_by_projection(query)
+		query = self._columns_hint_for_star(query, values, require_order)
+		self._cursor.require_order = require_order
 		return super().execute_query(query, values)
+
+	_STAR_SELECT = re.compile(r"(?is)^\s*select\s+\*\s+from\s+(?:`|\")?(\w+)(?:`|\")?")
+
+	def _order_by_projection(self, query: str) -> str:
+		"""Raw `select <cols> from <table> ... order by <f>` where <f> is not in the projection:
+		SurrealQL's ORDER BY only sees the projection (measured: `select code ... order by name`
+		is a syntax error while `order by code` works). The translator projects its ordering
+		columns as hidden `__oN` for the same reason - do the same here and pin the consumer's
+		column order with the /*cols:*/ hint."""
+		if re.search(r"/\*\s*cols:", query) or re.search(r"(?i)\bjoin\b", query):
+			return query
+		m = re.match(r"(?is)^(.*?)(\border\s+by\s+(.+))$", query.strip())
+		if not m:
+			return query
+		head, order_part = m[1].strip(), m[3]
+		# order clause: field list, then an optional LIMIT/START tail
+		tail_m = re.search(r"(?is)\s+(limit|start|offset)\s+\d+", order_part)
+		tail = order_part[tail_m.start() :] if tail_m else ""
+		order_terms = (order_part[: tail_m.start()] if tail_m else order_part).strip()
+		proj_m = re.match(r"(?is)^select\s+(.+?)\s+from\b", head)
+		if not proj_m:
+			return query
+		projections = [p.strip() for p in _split_top(proj_m[1])]
+		for p in projections:
+			if not re.fullmatch(r"(?:`[\w@]+`|\w+)(?:\s+as\s+\w+)?", p, re.I):
+				return query  # complex projection: leave the statement untouched
+		projected = {re.sub(r"[`]", "", p.split()[-1 if re.search(r"(?i)\s+as\s", p) else 0]).lower() for p in projections}
+		schema = None
+		table_m = re.search(r"(?is)from\s+(`[^`]+`|\"[^\"]+\"|[\w@]+)", head)
+		if table_m:
+			try:
+				schema = table_schema(unquote(table_m[1]), db=self)
+			except Exception:
+				schema = None
+		hidden, rewritten = [], []
+		for term in [t.strip() for t in _split_top(order_terms)]:
+			fm = re.fullmatch(r"(`?)([\w@]+)\1(\s+(?:asc|desc))?", term, re.I)
+			if not fm or fm[2].lower() in projected or (schema and schema.column(fm[2]) is None):
+				rewritten.append(term)
+				continue
+			rewritten.append(f"`__o{len(hidden)}`{fm[3] or ''}")
+			hidden.append(fm[2])
+		if not hidden:
+			return query
+		proj_start, proj_end = proj_m.span(1)
+		new_projections = ", ".join([*projections, *(f"`{f}` AS `__o{i}`" for i, f in enumerate(hidden))])
+		query = f"{head[:proj_start]}{new_projections}{head[proj_end:]} ORDER BY {', '.join(rewritten)}{tail}"
+		names = [re.sub(r"[`]", "", p.split()[-1] if re.search(r"(?i)\s+as\s", p) else p) for p in projections]
+		if schema:
+			kinds = [schema.column(n).kind for n in names if schema.column(n) is not None]
+			if len(kinds) == len(names):
+				query += f" /*kinds:{','.join(kinds)}*/"
+		return f"{query} /*cols:{','.join(names)}*/"
+
+	def _columns_hint_for_star(self, query: str, values, require_order: bool = True) -> str:
+		"""A raw `select * from <table>` read positionally (as_list / plain tuples / pluck) needs the
+		translator's column-order hint: SurrealDB returns object keys alphabetically - plus the
+		collation shadows - while MariaDB returns columns in schema order. The hint (in the same shape
+		the translator emits for its own star projections) restores the schema order, drops the shadow
+		keys and decodes the temporal columns. `as_dict` consumers keep the raw alphabetical rows.
+
+		Guarded by the driver contract (P1.6): it only fires for parameterless reads (values passed -
+		including named temporal params, which are refused - must not touch the server before the
+		refusal) and only when a *real* `INFO FOR TABLE` response (it carries the `fields` key) yields
+		a schema; anything else lets the cursor's no-column-order error fire."""
+		if not require_order or values is not None:
+			return query
+		m = self._STAR_SELECT.match(query)
+		if not m or re.search(r"(?i)\bjoin\b", query) or re.search(r"/\*\s*cols:", query):
+			return query
+		try:
+			info = self._info(f"INFO FOR TABLE {m[1]}")
+			if "fields" not in info:
+				return query  # not a real INFO response: no trustworthy column order
+			cols = list(table_schema_from_info(m[1], info).columns.values())
+		except Exception:
+			return query  # unknown table: let the server report it
+		if not cols:
+			return query
+		cols_hint = ",".join(spec.name for spec in cols)
+		kinds_hint = ",".join(spec.kind for spec in cols)
+		return f"{query} /*cols:{cols_hint}*/ /*kinds:{kinds_hint}*/"
 
 	def sql_ddl(self, query, debug=False):
 		"""Commit, run a DDL statement, commit again. MariaDB DDL autocommits; here it must too, because SurrealDB
@@ -240,9 +374,33 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		# `--transaction-timeout` is not enforced on interactive transactions (P0.4).
 		self._conn.statement_timeout = seconds
 
+	@contextmanager
+	def unbuffered_cursor(self):
+		"""SurrealDB hands the SDK the complete result set - there is no server-side cursor to switch
+		to - so the buffered cursor already returns every row; yield it unchanged. (Memory is not
+		streamed, but all rows are returned exactly once, which is what the callers rely on.)"""
+		yield
+
 	@staticmethod
 	def escape(s, percent=True):
 		unsupported("string escaping (values must be bound, never interpolated)", "P1.3")
+
+	def mogrify(self, query: Query, values: QueryValues):
+		"""Log-display form of a statement. P1.3: the driver always executes with bound
+		values, so nothing is interpolated into the query; the log shows the query as
+		sent plus the bound values. This bypasses the base-class fallback, which would
+		call `frappe.db.escape` - fail-closed on this backend - whenever a statement
+		(e.g. a DDL-classified `CREATE ... SET x = $v`) is logged with values. Temporal
+		values are displayed as their MariaDB literal form (`2026-09-21 10:00:00`)."""
+		if not values:
+			return query
+		return f"{query} /* values: {_display_values(values)!r} */"
+
+	def log_query(self, query, query_type, values, debug):
+		mogrified_query = self.mogrify(query, values)
+		self.last_query = mogrified_query
+		self._log_query(mogrified_query, query_type, debug, query)
+		return mogrified_query
 
 	def get_database_size(self):
 		unsupported("database size", "P4.5")
@@ -507,6 +665,14 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 	def create_singles_table(self):
 		"""MariaDB's tabSingles (`frappe.qb.into("Singles")` resolves to `tabSingles` via get_table_name)."""
 		self._create_system_table("tabSingles")
+
+	def create_series_table(self):
+		"""MariaDB's tabSeries (naming-series counters; `frappe.qb.DocType("Series")` statements)."""
+		self._create_system_table("tabSeries")
+
+	def create_sessions_table(self):
+		"""MariaDB's tabSessions (the `Session` doctype is gone in v16; sessions.py writes it directly)."""
+		self._create_system_table("tabSessions")
 
 	@staticmethod
 	def get_on_duplicate_update():

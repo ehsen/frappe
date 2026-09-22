@@ -18,6 +18,9 @@ Rules that make results identical to MariaDB (each one is covered by the MariaDB
   propagates like MariaDB (SurrealQL raises on `NULL + 1`), division is decimal, ROUND rounds half away from zero (SurrealDB
   rounds to even).
 * **Joins.** SurrealDB has no JOIN: a join is a correlated sub-select per left row, flattened (see `_joined_source`).
+* **Correlated sub-queries.** A scalar sub-query that reads a column of the outer row is evaluated once per outer row: a
+  one-element `array::map` closure carries the referenced outer columns to the sub-query (see `OuterScope`). Correlated
+  `IN`/`EXISTS` still fail closed.
 * **Column order.** Every projection ends with `/*cols:a,b,c*/` (SurrealDB returns object keys alphabetically).
 * **Parameters.** Values are always bound (`$paramN`), never interpolated.
 """
@@ -198,6 +201,7 @@ class Renderer:
 		self.shared = parent.shared if parent else _Shared()
 		self.ctxs: list[TableCtx] = []
 		self.outer: Grouping | None = None  # set while compiling the outer level of an aggregate query
+		self.correlated: "OuterScope | None" = None  # set while compiling a correlated sub-query (P1.6c)
 		self._key_projection = False
 
 	# --- entry -----------------------------------------------------------------------------------------------------
@@ -306,6 +310,10 @@ class Renderer:
 			return ("id", id(term))
 
 	def _field_expr(self, field) -> Expr:
+		if self.correlated is not None:
+			bound = self.correlated.try_resolve(field)
+			if bound is not None:
+				return bound
 		ctx = self._owner(field)
 		spec = ctx.schema.column(field.name)
 		if spec is None:
@@ -613,6 +621,38 @@ class Renderer:
 				unsupported(f"CONCAT of a {a.kind} value (MariaDB's formatting is not reproduced)", P1_6C)
 		return Expr(self._null_safe(args, f"string::concat({', '.join(parts)})"), _synthetic("varchar"))
 
+	def _fn_concat_ws(self, args, term):
+		"""`CONCAT_WS(sep, v1, v2, ..)`. MariaDB returns NULL for a NULL separator but *skips* NULL values, while SurrealDB's
+		`string::concat` would print them as 'NULL'; so every value part carries a NULL/NONE guard (measured, P1.6c)."""
+		if not args:
+			unsupported("CONCAT_WS without a separator", P1_6C)
+		sep = args[0]
+		if not sep.is_const:
+			unsupported("CONCAT_WS with a non-constant separator", P1_6C)
+		if sep.const is None:
+			return Expr("NULL", _synthetic("varchar"))
+		if len(args) == 1:  # no values: MariaDB returns ''
+			return Expr(f"string::concat({self.params.add('')})", _synthetic("varchar"))
+		fam = self._family(sep)
+		if fam not in ("str", "num") or isinstance(sep.const, float | Decimal):
+			unsupported("CONCAT_WS with a constant separator that MariaDB would format", P1_6C)
+		parts = [self.params.add(str(sep.const) if fam == "num" else values.to_str(sep.const))]
+		for a in args[1:]:
+			if a.is_const:
+				if a.const is None:
+					continue  # MariaDB skips NULL values
+				fam = self._family(a)
+				if fam not in ("str", "num") or isinstance(a.const, float | Decimal):
+					unsupported("CONCAT_WS of a constant that MariaDB would format", P1_6C)
+				parts.append(self.params.add(str(a.const) if fam == "num" else values.to_str(a.const)))
+			elif a.kind in ("varchar", "text", "date", "datetime", "uuid"):
+				parts.append(f"IF {a.sql} = NULL OR {a.sql} = NONE THEN '' ELSE {a.sql} END")
+			elif a.kind in INT_KINDS:
+				parts.append(f"IF {a.sql} = NULL OR {a.sql} = NONE THEN '' ELSE <string>{a.sql} END")
+			else:
+				unsupported(f"CONCAT_WS of a {a.kind} value (MariaDB's formatting is not reproduced)", P1_6C)
+		return Expr(f"string::concat({', '.join(parts)})", _synthetic("varchar"))
+
 	def _rounding(self, args, truncate: bool) -> Expr:
 		x = args[0]
 		digits = 0
@@ -842,11 +882,15 @@ class Renderer:
 		if spec is None:
 			unsupported("comparing constants", "P1.6")
 		if spec.is_varchar:
-			if isinstance(value, bool | int | float | Decimal):
+			# patch_text_int_cmp (official-run blocker #3) (varchar)
+			if isinstance(value, float | Decimal):
 				unsupported(
-					"comparing a string column with a number (MariaDB converts the column to a number)",
+					"comparing a string column with a non-integer number (MariaDB converts the column to a number)",
 					"P1.6",
 				)
+			if isinstance(value, bool | int):
+				# MariaDB casts the string column to a number; see the text branch note.
+				value = "1" if (isinstance(value, bool) and value) else str(int(value))
 			if e.ci is None:
 				unsupported(
 					"comparing a computed string (its collation key cannot be computed in SurrealQL)", P1_6C
@@ -879,6 +923,26 @@ class Renderer:
 			except values.ValueError_ as e_:
 				unsupported(f"an invalid {spec.kind} literal ({e_})", "P1.6")
 			return e.sql, self.params.add(encoded)
+		if spec.kind == "text":
+			# Text columns (Small Text/Text/Long/Medium - they share the `text` kind) have no collation
+			# shadow - only varchar columns get one - but their comparisons are ASCII in practice.
+			# Approximate MariaDB's *_ci collation with an inline case-fold on both sides; NULL never
+			# compares equal (MariaDB UNKNOWN - and SurrealDB's string::lowercase(NULL) raises, so the
+			# stored side carries the NULL/NONE guard). Upstream test_db compares these columns directly
+			# (bulk_insert cleanup, DocField cache flows), so they are supported; LIKE/ORDER BY/GROUP BY
+			# on them stay refused (the collation extension, P1.6d).
+			if not isinstance(value, str):
+				# patch_text_int_cmp (official-run blocker #3)
+				if isinstance(value, bool | int):
+					# MariaDB casts the string column to a number, so `text_col = 1` matches '1'
+					# (Property Setter: `value = 1` on every Email Account validate). Frappe stores
+					# flag values canonically as '1'/'0'; approximate the numeric cast with the
+					# canonical decimal string ('01'/' 1' variants differ - see OPEN-ITEMS).
+					value = "1" if (isinstance(value, bool) and value) else str(int(value))
+				else:
+					unsupported(f"comparing a text column with a non-string ({type(value).__name__})", "P1.6")
+			operand = self.params.add(values.to_str(value))
+			return self._null_safe([e], f"string::lowercase({e.sql})"), f"string::lowercase({operand})"
 		unsupported(f"comparing a {spec.logical} column (long text needs the collation extension)", "P1.6")
 
 	@staticmethod
@@ -1051,16 +1115,20 @@ class Renderer:
 		return f"({self._guard(stored)} AND {stored} >= {lo_p} AND {stored} <= {hi_p})"
 
 	# sub-queries -----------------------------------------------------------------------------------------------------
+	def _hoist(self, rows: str) -> str:
+		"""A `LET $sqN` statement that runs the (already rendered) uncorrelated sub-query once, before the statement."""
+		self.shared.counter += 1
+		name = f"$sq{self.shared.counter}"
+		self.shared.prelude.append(f"LET {name} = (SELECT VALUE `__c0` FROM ({rows}))")
+		return name
+
 	def _run_subquery(self, q, key: bool):
 		"""Hoist an uncorrelated sub-query into a `LET $sqN` statement that runs before the statement (it is evaluated once).
 		Returns (parameter name, spec of its first column, the child renderer)."""
 		child = self._child()
 		child._key_projection = key
 		rows = child.select(q, hints=False)
-		self.shared.counter += 1
-		name = f"$sq{self.shared.counter}"
-		self.shared.prelude.append(f"LET {name} = (SELECT VALUE `__c0` FROM ({rows}))")
-		return name, child.result_specs[0], child
+		return self._hoist(rows), child.result_specs[0], child
 
 	def _in_subquery(self, left: Expr, q, negate: bool) -> str:
 		if len(q._selects) != 1:
@@ -1087,11 +1155,48 @@ class Renderer:
 		name, _, _ = self._run_subquery(term.container, key=False)
 		return f"array::len({name}) {'=' if negate else '>'} 0"
 
+	def _count_scalar(self, q) -> bool:
+		"""`SELECT COUNT(*) FROM t` without GROUP BY: MariaDB answers one row (0 for an empty t), while SurrealDB's
+		`GROUP ALL` over no records returns none, so this scalar sub-query needs an empty-set default of 0."""
+		if q._groupbys or q._distinct or q._havings or q._limit is not None or q._offset or len(q._selects) != 1:
+			return False
+		term = q._selects[0]
+		return (
+			isinstance(term, AggregateFunction)
+			and str(term.name).strip().upper() == "COUNT"
+			and not _attr(term, "_distinct", False)
+		)
+
 	def _scalar_subquery(self, q) -> Expr:
 		if len(q._selects) != 1:
 			raise SurrealDBProgrammingError(1241, "Operand should contain 1 column(s)")
-		name, spec, _ = self._run_subquery(q, key=False)
-		return Expr(f"array::first({name})", spec)
+		child = self._child()
+		child._key_projection = False
+		child.correlated = OuterScope(self, child)
+		rows = child.select(q, hints=False)
+		zero = self._count_scalar(q)
+		if not child.correlated.bound:
+			name = self._hoist(rows)
+			ref = f"array::first({name})"
+			if zero:
+				ref = f"IF array::len({name}) = 0 THEN 0 ELSE {ref} END"
+			return Expr(ref, child.result_specs[0])
+		# A correlated scalar sub-query is evaluated per outer row: one closure step carries the referenced outer
+		# columns as the keys of a one-element object (the binding the join renderer uses, so an index on the inner
+		# column is used - SurrealDB plans a TableScan for `$parent.x`, findings/P1.6-builder.md § 9), and the inner
+		# query picks the first of its rows for that value (NONE when there is none, like MariaDB's empty result).
+		obj = "{" + ", ".join(child.correlated.bundle) + "}"
+		if zero:
+			# the inner query runs once per row: a `LET` and the brace form of IF, exactly the LEFT JOIN block's shape
+			self.shared.counter += 1
+			name = f"$sq{self.shared.counter}"
+			body = (
+				f"{{ LET {name} = (SELECT VALUE `__c0` FROM ({rows})); "
+				f"IF array::len({name}) = 0 {{ 0 }} ELSE {{ array::first({name}) }} }}"
+			)
+		else:
+			body = f"(SELECT VALUE `__c0` FROM ({rows}))[0]"
+		return Expr(f"(array::map([{obj}], |$o| {body}))[0]", child.result_specs[0])
 
 	# --- SELECT ------------------------------------------------------------------------------------------------------
 	def _conjuncts(self, term):
@@ -1747,18 +1852,16 @@ class Grouping:
 		return Expr(f"IF `__n{i}` = 0 THEN NULL ELSE {mean} END", _synthetic("decimal", scale))
 
 	def _min_max(self, term, name, e, i, distinct, star):
-		if e.kind in ("date", "datetime"):
-			# stored as text: math::min/max would give +-Infinity. Collect the distinct values, drop NULLs, sort, take an end
-			self.inner.append(f"array::group({e.sql}) AS `__a{i}`")
-			pick = "first" if name == "MIN" else "last"
-			return Expr(f"array::{pick}(array::sort(array::complement(`__a{i}`, [NULL, NONE])))", e.spec)
-		if e.kind not in (*NUMERIC_KINDS, "time"):
+		if e.kind not in (*NUMERIC_KINDS, "time", "date", "datetime"):
 			unsupported(
 				f"{name} of a {e.kind} value (needs the value behind the smallest collation key)", "P1.6"
 			)
-		function = "math::min" if name == "MIN" else "math::max"
-		self.inner += [f"{function}({e.sql}) AS `__a{i}`", f"count({_present(e.sql)}) AS `__n{i}`"]
-		return Expr(f"IF `__n{i}` = 0 THEN NULL ELSE `__a{i}` END", e.spec)
+		# Collect the group's values, drop NULL/NONE and take an end of the sorted ones. `math::max` skips NULLs in a
+		# mixed group, but errors on a stored NULL and answers -inf/+inf when every value of the group is NULL/NONE -
+		# MariaDB answers NULL (measured, P1.6c). Dates are stored as text, where math::min/max would compare lexically.
+		self.inner.append(f"array::group({e.sql}) AS `__a{i}`")
+		pick = "first" if name == "MIN" else "last"
+		return Expr(f"array::{pick}(array::sort(array::complement(`__a{i}`, [NULL, NONE])))", e.spec)
 
 	def _group_concat(self, term, name, e, i, distinct, star):
 		if distinct or star:
@@ -1779,6 +1882,71 @@ class Grouping:
 			f"IF array::len({present}) = 0 THEN NULL ELSE array::join({present}, {sep}) END",
 			_synthetic("varchar"),
 		)
+
+
+class OuterScope:
+	"""The outer query's row, bound for a correlated scalar sub-query (P1.6c).
+
+	SurrealDB evaluates the sub-query once per outer row, but a bare column name inside it resolves against the
+	*inner* tables (measured: it does not reach the outer row), and `$parent.x` plans a TableScan instead of an
+	index lookup (findings/P1.6-builder.md § 9). So each outer column the sub-query references becomes a key of a
+	one-element object that an `array::map` closure passes to the sub-query as `$o` - the binding the join renderer
+	uses, which keeps the inner column's index usable. A varchar outer column contributes its collation key, so the
+	comparison inside the sub-query is case-insensitive like MariaDB's."""
+
+	def __init__(self, host: "Renderer", child: "Renderer"):
+		self.host = host  # the statement whose row the object carries (one level out)
+		self.child = child
+		self.bundle: list[str] = []  # `` `kN`: <SurrealQL of the outer value>`` entries of the closure object
+		self.refs: dict = {}  # (table id, column name) -> the bound `$o.`kN`` expression
+		self._n = 0
+
+	@property
+	def bound(self) -> bool:
+		return bool(self.bundle)
+
+	def try_resolve(self, field) -> "Expr | None":
+		"""The bound reference for an outer column, or None when `field` belongs to the sub-query itself."""
+		table = getattr(field, "table", None)
+		if table is not None:
+			if any(self.child._same_table(c.table, table) for c in self.child.ctxs):
+				return None  # the sub-query binds this table itself: it shadows the outer one
+			for ctx in self.host.ctxs:
+				if self.host._same_table(ctx.table, table):
+					return self._bind(ctx, field)
+			return None  # not bound here (an outer query further out or unknown): `_owner` decides
+		if any(c.schema.column(field.name) is not None for c in self.child.ctxs):
+			return None  # an unqualified column of the sub-query
+		matches = [c for c in self.host.ctxs if c.schema.column(field.name) is not None]
+		if len(matches) == 1:
+			return self._bind(matches[0], field)
+		if len(matches) > 1:
+			raise SurrealDBProgrammingError(1052, f"Column '{field.name}' in field list is ambiguous")
+		return None  # no such column anywhere: the child's own error (1054)
+
+	def _bind(self, ctx: TableCtx, field) -> Expr:
+		if self.host.outer is not None:
+			# a column of the outer row cannot be reached from the group level (it would need the Grouping's
+			# `array::first` forms, which the sub-query's row context cannot see)
+			unsupported("a correlated sub-query at the outer level of an aggregate query", P1_6C)
+		spec = ctx.schema.column(field.name)
+		if spec is None:
+			raise SurrealDBProgrammingError(1054, f"Unknown column '{field.name}' in 'field list'")
+		key = (id(ctx.table), field.name)
+		ref = self.refs.get(key)
+		if ref is not None:
+			return ref
+		e = self.host._col(ctx, spec)
+		self._n += 1
+		name = f"k{self._n}"
+		if spec.is_varchar:
+			self.bundle += [f"{quote(name)}: {e.ci}", f"{quote(name + 'l')}: {e.like}"]
+			ref = Expr(f"$o.{quote(name)}", spec, ci=f"$o.{quote(name)}", like=f"$o.{quote(name + 'l')}")
+		else:
+			self.bundle.append(f"{quote(name)}: {e.sql}")
+			ref = Expr(f"$o.{quote(name)}", spec)
+		self.refs[key] = ref
+		return ref
 
 
 def render(query, param_wrapper=None, schema_loader=None):

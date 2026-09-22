@@ -26,6 +26,9 @@ ER_DUP_ENTRY = 1062
 ER_CANT_DROP_FIELD_OR_KEY = 1091
 ER_DEADLOCK = 1213
 ER_LOCK_WAIT_TIMEOUT = 1205
+# ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION: `START TRANSACTION READ ONLY` rejects writes, which
+# `SurrealDBExceptionUtil.is_read_only_mode_error` maps to frappe.InReadOnlyMode (base Database).
+ER_READONLY = 1792
 ER_DATA_TOO_LONG = 1406
 ER_TRUNCATED_WRONG_VALUE = 1366
 ER_STATEMENT_TIMEOUT = 1969
@@ -267,6 +270,10 @@ _TRANSPORT_NAMES = (
 	"ConnectionUnavailableError",
 	"ConnectionRefusedError",
 	"InvalidStatus",
+	# A response whose id belongs to another (abandoned / late) request means the
+	# websocket session is out of sync; treat it as a transport failure so the
+	# driver can mark the connection lost and reconnect (see SurrealConnection).
+	"UnexpectedResponseError",
 )
 
 

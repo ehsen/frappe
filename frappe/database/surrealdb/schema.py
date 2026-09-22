@@ -653,6 +653,7 @@ SYSTEM_KEYS = {
 	"__Auth": ("doctype", "name", "fieldname"),
 	"__global_search": ("doctype", "name"),
 	"__UserSettings": ("user", "doctype"),
+	"tabSessions": ("sid",),
 	"tabSingles": ("doctype", "field"),
 }
 
@@ -703,6 +704,27 @@ def system_table_statements(name: str) -> list[str]:
 			ColumnSpec("value", "longtext", True),
 		]
 		unique = ("PRIMARY", ["doctype", "field"])
+	elif name == "tabSeries":
+		# tabSeries is created outside DocType sync too (MariaDB: framework SQL), but unlike the other
+		# system tables it HAS a `name` column: the record id is the document-style one, and naming.py's
+		# `Series` reads/writes it with plain `WHERE name = ...` qb statements.
+		cols = [
+			ColumnSpec("name", "varchar(100)", False),
+			ColumnSpec("current", "int(11)", False, 0),
+		]
+		unique = ("PRIMARY", ["name"])
+	elif name == "tabSessions":
+		# The `Session` doctype no longer exists in v16 (MariaDB: framework SQL); sessions.py writes
+		# the rows directly through `frappe.qb` (`insert_session_record`). `sid` is the row key.
+		cols = [
+			ColumnSpec("user", "varchar(255)"),
+			ColumnSpec("sid", "varchar(255)"),
+			ColumnSpec("sessiondata", "longtext"),
+			ColumnSpec("ipaddress", "varchar(16)"),
+			ColumnSpec("lastupdate", "datetime(6)"),
+			ColumnSpec("status", "varchar(20)"),
+		]
+		unique = ("sid", ["sid"])
 	else:
 		raise SurrealDBProgrammingError(0, f"Unknown system table {name!r}")
 	stmts = [f"DEFINE TABLE {quote_table(name)} SCHEMAFULL"]
