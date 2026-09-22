@@ -18,9 +18,10 @@ Rules that make results identical to MariaDB (each one is covered by the MariaDB
   propagates like MariaDB (SurrealQL raises on `NULL + 1`), division is decimal, ROUND rounds half away from zero (SurrealDB
   rounds to even).
 * **Joins.** SurrealDB has no JOIN: a join is a correlated sub-select per left row, flattened (see `_joined_source`).
-* **Correlated sub-queries.** A scalar sub-query that reads a column of the outer row is evaluated once per outer row: a
+* **Correlated sub-queries.** A sub-query that reads a column of the outer row is evaluated once per outer row: a
   one-element `array::map` closure carries the referenced outer columns to the sub-query (see `OuterScope`). Correlated
-  `IN`/`EXISTS` still fail closed.
+  `EXISTS` answers per row with the number of the inner rows for the binding, and a correlated `IN` carries its left
+  operand through the same binding (both take the scalar sub-query's closure shape).
 * **Column order.** Every projection ends with `/*cols:a,b,c*/` (SurrealDB returns object keys alphabetically).
 * **Parameters.** Values are always bound (`$paramN`), never interpolated.
 """
@@ -30,6 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from types import SimpleNamespace
 from typing import ClassVar
 
 from pypika.queries import QueryBuilder
@@ -193,6 +195,15 @@ class _Shared:
 		self.now: str | None = None
 
 
+class _CommaJoin:
+	"""A synthesized `JOIN ... ON` step for Frappe's legacy comma joins (`how` "" - an INNER join)."""
+
+	def __init__(self, item, criterion):
+		self.item = item
+		self.criterion = criterion
+		self.how = ""
+
+
 class Renderer:
 	def __init__(self, params: Params | None = None, schema_loader=None, parent: "Renderer | None" = None):
 		self.params = params or Params()
@@ -203,6 +214,7 @@ class Renderer:
 		self.outer: Grouping | None = None  # set while compiling the outer level of an aggregate query
 		self.correlated: "OuterScope | None" = None  # set while compiling a correlated sub-query (P1.6c)
 		self._key_projection = False
+		self._aliases: dict = {}  # the projection's display names -> their terms, for ORDER BY <alias>
 
 	# --- entry -----------------------------------------------------------------------------------------------------
 	def render(self, q) -> str:
@@ -537,6 +549,46 @@ class Renderer:
 		if spec.is_varchar and all(t[1] is not None for t in out):
 			expr.ci, expr.like = chain(lambda t: t[1]), chain(lambda t: t[2])
 		return expr
+
+	def _fn_field(self, args: list[Expr], term) -> Expr:
+		"""FIELD(needle, v1 .. vn): MariaDB's 1-based position of the first value equal to the needle, else 0.
+		The needle meets every value in its own comparison (a varchar needle through the collation shadows), and
+		NULL never matches - `FIELD(NULL, ..)` and a NULL entry both simply rank 0."""
+		if len(args) < 2:
+			unsupported("FIELD with fewer than two operands", P1_6C)
+		needle, values = args[0], args[1:]
+		if needle.is_const and all(v.is_const for v in values):
+			# constant-folded, like MariaDB (numbers coerce strings; strings meet under the *_ci collation)
+			index = next((i for i, v in enumerate(values, 1) if self._const_eq(needle.const, v.const)), 0)
+			return Expr(str(index), _synthetic("bigint"), const=index)
+		chain = " ELSE ".join(f"IF {self._compare('=', needle, v)} THEN {i}" for i, v in enumerate(values, 1))
+		return Expr(f"{chain} ELSE 0 END", _synthetic("bigint"))
+
+	@staticmethod
+	def _const_eq(a, b) -> bool:
+		"""MariaDB's two-literal `=`: numbers coerce (a string becomes its number), strings meet under the
+		connection's *_ci collation, anything else must be exactly equal."""
+		if a is None or b is None:
+			return False
+		if isinstance(a, bool):
+			a = int(a)
+		if isinstance(b, bool):
+			b = int(b)
+		if isinstance(a, int | float | Decimal) and isinstance(b, int | float | Decimal):
+			return Decimal(str(a)) == Decimal(str(b))
+		if isinstance(a, str) and isinstance(b, str):
+			return collation.ci_key(a) == collation.ci_key(b)
+		if isinstance(a, str) and isinstance(b, int | float | Decimal):
+			try:
+				return Decimal(a.strip()) == Decimal(str(b))
+			except InvalidOperation:
+				return False
+		if isinstance(b, str) and isinstance(a, int | float | Decimal):
+			try:
+				return Decimal(b.strip()) == Decimal(str(a))
+			except InvalidOperation:
+				return False
+		return a == b
 
 	# functions -----------------------------------------------------------------------------------------------------
 	def _function(self, term) -> Expr:
@@ -1073,13 +1125,13 @@ class Renderer:
 	def _contains(self, term, negate: bool) -> str:
 		negate = negate != bool(getattr(term, "_is_negated", False))
 		left = self.expr(term.term)
-		if left.is_const:
-			unsupported("IN with a constant on the left", "P1.6")
 		container = term.container
 		if isinstance(container, QueryBuilder):
 			return self._in_subquery(left, container, negate)
 		if _kind(container) != "Tuple":
 			unsupported(f"IN over a {_kind(container)}", "P1.6")
+		if left.is_const:
+			return self._const_in(left, container, negate)
 		items = []
 		for item in container.values:
 			is_literal, value = self._literal(item)
@@ -1097,6 +1149,33 @@ class Renderer:
 			operands.append(operand)
 		membership = f"{stored} IN [{', '.join(operands)}]"
 		return f"({self._guard(stored)} AND NOT ({membership}))" if negate else f"({membership})"
+
+	def _const_in(self, left: Expr, container, negate: bool) -> str:
+		"""`'x' IN (..)` with a constant on the left (the note.py login check and friends): MariaDB folds the
+		literal elements; an element that is a column is one membership comparison, and a NULL element or needle
+		is UNKNOWN - the row never matches (for NOT IN too, unless the list is empty)."""
+		needle = left.const
+		literal, exprs = [], []
+		for item in container.values:
+			is_literal, value = self._literal(item)
+			(literal if is_literal else exprs).append(value if is_literal else item)
+		if needle is None:
+			if not literal and not exprs:
+				return "true" if negate else "false"  # an empty list: `x NOT IN ()` is vacuously true
+			return "false"  # NULL = anything is UNKNOWN, and its negation over a non-empty list as well
+		matches = any(value is not None and self._const_eq(needle, value) for value in literal)
+		has_null = any(value is None for value in literal)
+		if negate:
+			if matches or has_null:
+				return "false"  # an element equal to the needle is false; a NULL element is UNKNOWN
+			compares = [self._compare("!=", self.expr(item), left) for item in exprs]
+			return "(" + " AND ".join(compares) + ")" if compares else "true"
+		if matches:
+			return "true"
+		if has_null and not exprs:
+			return "false"  # only UNKNOWN elements: no element can make the membership true
+		compares = [self._compare("=", self.expr(item), left) for item in exprs]
+		return "(" + " OR ".join(compares) + ")" if compares else "false"
 
 	def _between(self, term, negate: bool) -> str:
 		left = self.expr(term.term)
@@ -1122,26 +1201,47 @@ class Renderer:
 		self.shared.prelude.append(f"LET {name} = (SELECT VALUE `__c0` FROM ({rows}))")
 		return name
 
-	def _run_subquery(self, q, key: bool):
-		"""Hoist an uncorrelated sub-query into a `LET $sqN` statement that runs before the statement (it is evaluated once).
-		Returns (parameter name, spec of its first column, the child renderer)."""
-		child = self._child()
-		child._key_projection = key
-		rows = child.select(q, hints=False)
-		return self._hoist(rows), child.result_specs[0], child
-
 	def _in_subquery(self, left: Expr, q, negate: bool) -> str:
 		if len(q._selects) != 1:
 			raise SurrealDBProgrammingError(1241, "Operand should contain 1 column(s)")
-		name, spec, _ = self._run_subquery(q, key=True)
+		child = self._child()
+		child._key_projection = True
+		child.correlated = OuterScope(self, child)
+		rows = child.select(q, hints=False)
+		spec = child.result_specs[0]
+		if left.is_const and left.const is None:
+			# `NULL IN (..)` is UNKNOWN (never true); its negation is true only over an empty list
+			if not negate:
+				return "false"
+			if child.correlated.bound:
+				arr = f"(SELECT VALUE `__c0` FROM ({rows}))"
+				return f"(array::map([{{{', '.join(child.correlated.bundle)}}}], |$o| array::len({arr}) = 0))[0]"
+			return f"array::len({self._hoist(rows)}) = 0"
 		fa = self._family(left)
 		if fa != self._family(Expr(None, spec)) or fa == "long":
 			unsupported("IN (sub-query) over columns of different types", P1_6C)
-		if fa == "str" and not (left.ci is not None and spec.is_varchar):
-			unsupported("IN (sub-query) over a computed string", P1_6C)
-		if left.opaque_string:
-			unsupported("IN (sub-query) over IFNULL(non-string, '')", P1_6C)
-		ref = left.ci if fa == "str" and spec.is_varchar else left.sql
+		varchar_key = fa == "str" and spec.is_varchar
+		name = None if child.correlated.bound else self._hoist(rows)
+		if not left.is_const:
+			if fa == "str" and not (left.ci is not None and spec.is_varchar):
+				unsupported("IN (sub-query) over a computed string", P1_6C)
+			if left.opaque_string:
+				unsupported("IN (sub-query) over IFNULL(non-string, '')", P1_6C)
+		if child.correlated.bound:
+			return self._correlated_in(child.correlated, left, rows, negate, varchar_key)
+		if left.is_const:
+			if left.const is None:
+				return "false"  # `NULL IN (..)` is UNKNOWN, and its negation over a non-empty list as well
+			bound = self._bind_const(left.const, fa, spec)
+			ref = bound[1] if varchar_key else bound[0]
+			# a bound constant is never NULL/NONE: it needs no guard
+			if not negate:
+				return f"({ref} IN {name})"
+			return (
+				f"(array::len({name}) = 0 OR (NOT ({ref} IN {name}) "
+				f"AND NOT (NULL IN {name}) AND NOT (NONE IN {name})))"
+			)
+		ref = left.ci if varchar_key else left.sql
 		if not negate:
 			return f"({self._guard(ref)} AND {ref} IN {name})"
 		# NOT IN: true for every row when the sub-query is empty, never true when it holds a NULL
@@ -1150,10 +1250,45 @@ class Renderer:
 			f"AND NOT (NULL IN {name}) AND NOT (NONE IN {name})))"
 		)
 
+	def _correlated_in(self, scope: OuterScope, left: Expr, rows: str, negate: bool, varchar_key: bool) -> str:
+		"""`x IN (SELECT y FROM .. WHERE <reads this row>)`: the truth is per outer row. The binding object of the
+		scalar sub-query's closure shape (an `array::map` over the referenced outer columns) carries the left operand
+		under its own key, and the inner rows for that binding answer the membership (the hoisted shape's guards)."""
+		if left.is_const:
+			if left.const is None:
+				return "false"  # `NULL IN (..)` is UNKNOWN, and its negation over a non-empty list as well
+			bound = self._bind_const(left.const, self._family(left))
+			ref = bound[1] if varchar_key else bound[0]
+		else:
+			if varchar_key and left.ci is None:
+				unsupported("IN (correlated sub-query) with a computed string on the left", P1_6C)
+			carried = scope.carry(left)
+			ref = carried.ci if varchar_key else carried.sql
+		arr = f"(SELECT VALUE `__c0` FROM ({rows}))"
+		guard = "" if left.is_const else f"{self._guard(ref)} AND "
+		if negate:
+			body = (
+				f"(array::len({arr}) = 0 OR ({guard}NOT ({ref} IN {arr}) "
+				f"AND NOT (NULL IN {arr}) AND NOT (NONE IN {arr})))"
+			)
+		else:
+			body = f"({guard}{ref} IN {arr})"
+		return f"(array::map([{{{', '.join(scope.bundle)}}}], |$o| {body}))[0]"
+
 	def _exists(self, term, negate: bool) -> str:
 		negate = negate != bool(getattr(term, "_is_negated", False))
-		name, _, _ = self._run_subquery(term.container, key=False)
-		return f"array::len({name}) {'=' if negate else '>'} 0"
+		child = self._child()
+		child._key_projection = False
+		child.correlated = OuterScope(self, child)
+		rows = child.select(term.container, hints=False)
+		if not child.correlated.bound:
+			name = self._hoist(rows)
+			return f"array::len({name}) {'=' if negate else '>'} 0"
+		# `EXISTS (SELECT .. WHERE <reads this row>)`: one truth per outer row - the scalar sub-query's closure
+		# shape, with the number of the inner rows for that binding instead of its first value.
+		obj = "{" + ", ".join(child.correlated.bundle) + "}"
+		body = f"array::len((SELECT VALUE `__c0` FROM ({rows})))"
+		return f"(array::map([{obj}], |$o| {body}))[0] {'=' if negate else '>'} 0"
 
 	def _count_scalar(self, q) -> bool:
 		"""`SELECT COUNT(*) FROM t` without GROUP BY: MariaDB answers one row (0 for an empty t), while SurrealDB's
@@ -1268,12 +1403,18 @@ class Renderer:
 
 	def _from_and_where(self, q) -> tuple[str, str | None]:
 		"""Bind the FROM/JOIN tables; returns (source for the FROM clause, WHERE text or None)."""
-		if len(q._from) != 1:
-			unsupported("a SELECT without exactly one table", "P1.6")
 		joins = list(_attr(q, "_joins") or [])
+		consumed: set[int] = set()
+		if len(q._from) > 1:
+			if joins:
+				unsupported("a comma join mixed with JOIN ... ON", P1_6C)
+			# Frappe's legacy comma join (`FROM a, b WHERE a.x = b.y`): a cross-table equality conjunct is
+			# exactly an INNER JOIN on it (the comma join is the cross product filtered by the WHERE), so the
+			# equalities become the join steps and the remaining conjuncts stay in the WHERE.
+			joins, consumed = self._comma_joins(q)
 		self.ctxs = [self._make_ctx(q._from[0], "t0")]
 		for i, join in enumerate(joins, 1):
-			if _kind(join) != "JoinOn":
+			if _kind(join) not in ("JoinOn", "_CommaJoin"):
 				unsupported("JOIN ... USING", P1_6C)
 			how = _attr_name(join.how).lower()
 			if how not in ("", "left", "left outer"):
@@ -1286,6 +1427,8 @@ class Renderer:
 		# WHERE conjuncts that concern only the first table are applied before joining
 		pushed, rest = [], []
 		for c in self._conjuncts(q._wheres) if q._wheres is not None else []:
+			if id(c) in consumed:
+				continue  # consumed by a synthesized comma-join step
 			(pushed if self._only_main(c) else rest).append(c)
 		self.ctxs[0].prefix = ""
 		pushed_sql = " AND ".join(self.predicate(c) for c in pushed)
@@ -1306,6 +1449,46 @@ class Renderer:
 		where = " AND ".join(self.predicate(c) for c in rest) if rest else None
 		return source, where
 
+	def _comma_joins(self, q) -> tuple[list, set]:
+		"""The INNER JOIN steps of a legacy comma join, in an order that connects every table, with the ids of
+		the WHERE conjuncts they consume. A conjunct qualifies when both of its sides are plain columns of one
+		FROM table each; other conjuncts stay in the WHERE (the cross product is filtered there, as MariaDB does)."""
+		if any(_kind(t) != "Table" for t in q._from[1:]):
+			unsupported("a derived table in a comma join", P1_6C)
+		eqs = []
+		for c in self._conjuncts(q._wheres) if q._wheres is not None else []:
+			if _kind(c) != "BasicCriterion" or _sql_word(c.comparator) != "=":
+				continue
+			sides = []
+			for side in (c.left, c.right):
+				try:
+					fields = side.fields_()
+				except Exception:
+					fields = None
+				tables = {id(f.table) for f in fields or [] if getattr(f, "table", None) is not None}
+				if not fields or len(tables) != 1 or any(getattr(f, "table", None) is None for f in fields):
+					break
+				sides.append(next(iter(tables)))
+			else:
+				if sides[0] != sides[1]:
+					eqs.append((c, sides[0], sides[1]))
+		order, joins, consumed = [id(q._from[0])], [], set()
+		by_id = {id(t): t for t in q._from}
+		while len(order) < len(q._from):
+			for c, a, b in eqs:
+				if id(c) in consumed or (a in order) == (b in order):
+					continue  # already connected, or neither side is bound yet
+				table_id = b if a in order else a
+				if table_id not in by_id or table_id in order:
+					continue
+				joins.append(_CommaJoin(by_id[table_id], c))
+				consumed.add(id(c))
+				order.append(table_id)
+				break
+			else:
+				unsupported("a comma join whose tables are not connected by equality conjuncts", P1_6C)
+		return joins, consumed
+
 	@staticmethod
 	def _has_aggregate(term) -> bool:
 		try:
@@ -1315,13 +1498,18 @@ class Renderer:
 
 	def select(self, q, hints: bool = True) -> str:
 		self._reject(q, "_union", "_with", "_prewheres")
+		self._aliases = {}
 		source, where = self._from_and_where(q)
 		mode = self._for_update_mode(q)
-		if q._groupbys or q._distinct or q._havings or any(self._has_aggregate(t) for t in q._selects):
+		grouped = q._groupbys or q._havings or any(self._has_aggregate(t) for t in q._selects)
+		if q._distinct and not grouped:
+			grouped = not self._distinct_noop(q)
+		if grouped:
 			if mode is not None:
 				unsupported("FOR UPDATE with GROUP BY / DISTINCT / HAVING / aggregates", "P1.8")
 			return self.grouped_select(q, source, where, hints)
 		columns = self._projection(q._selects, hints)
+		self._aliases = {self._display_name(term, None): term for term in q._selects if _kind(term) != "Star"}
 		hidden = []
 		ordering = []
 		for field, order in q._orderbys or []:
@@ -1486,7 +1674,36 @@ class Renderer:
 			)
 		return columns
 
+	def _distinct_noop(self, q) -> bool:
+		"""`SELECT DISTINCT` is a no-op when the projection holds the primary key of the one table it reads
+		(`name`): every output row is one record, so no two rows can be equal - the report view's
+		`SELECT DISTINCT name` needs neither GROUP BY nor sorting, just the rows."""
+		if len(self.ctxs) != 1 or self.ctxs[0].schema.column("name") is None:
+			return False
+		main = self.ctxs[0]
+		for term in q._selects:
+			table = getattr(term, "table", None)
+			if _kind(term) == "Star":
+				if table is None or self._same_table(main.table, table):
+					return True
+				continue
+			if _kind(term) != "Field" or term.name != "name":
+				continue
+			if table is None or self._same_table(main.table, table):
+				return True
+		return False
+
 	def _order(self, field, order) -> tuple[str, str]:
+		if (
+			_kind(field) == "Field"
+			and field.name in self._aliases
+			and all(c.schema.column(field.name) is None for c in self.ctxs)
+		):
+			# ORDER BY <select alias>: the name is not a column of any table read, so it must name the projection's
+			# output (MariaDB resolves ORDER BY names against the output columns first; pypika qualifies a string
+			# order_by with the FROM table). A name that is also a real column stays a direct reference - with
+			# `SELECT p.name, k.name` both terms display as "name" and the map cannot tell them apart.
+			field = self._aliases[field.name]
 		e = self.expr(field)
 		if e.is_const:
 			unsupported("ORDER BY a constant", "P1.6")
@@ -1523,6 +1740,7 @@ class Renderer:
 			g.add_key(term)
 		self.outer = g
 		try:
+			self._aliases = {self._display_name(term, None): term for term in q._selects if _kind(term) != "Star"}
 			columns = []
 			for term in q._selects:
 				if _kind(term) == "Star":
@@ -1947,6 +2165,17 @@ class OuterScope:
 			ref = Expr(f"$o.{quote(name)}", spec)
 		self.refs[key] = ref
 		return ref
+
+	def carry(self, e: Expr) -> Expr:
+		"""Carry an arbitrary outer expression (the left operand of a correlated IN) through the closure object,
+		under a fresh key (the sub-query's own references took k1..kN while it was rendered)."""
+		self._n += 1
+		name = f"k{self._n}"
+		if e.spec is not None and e.spec.is_varchar:
+			self.bundle += [f"{quote(name)}: {e.ci}", f"{quote(name + 'l')}: {e.like}"]
+			return Expr(f"$o.{quote(name)}", e.spec, ci=f"$o.{quote(name)}", like=f"$o.{quote(name + 'l')}")
+		self.bundle.append(f"{quote(name)}: {e.sql}")
+		return Expr(f"$o.{quote(name)}", e.spec)
 
 
 def render(query, param_wrapper=None, schema_loader=None):

@@ -6,6 +6,8 @@ from decimal import Decimal
 
 from pypika import Order, Table
 from pypika import functions as fn
+from pypika.functions import Function
+from pypika.terms import ExistsCriterion as Exists, Tuple, ValueWrapper
 
 import frappe
 from frappe.database.schema import DbColumn
@@ -269,9 +271,6 @@ class TestSurrealDBTranslator(UnitTestCase):
 			"function": q().select(fn.Upper(T.title)),  # case mapping differs (ß, İ): needs a shadow
 			"join using": q().join(other).using("name").select(T.name),
 			"right join": q().right_join(other).on(T.name == other.name).select(T.name),
-			"correlated sub-query": q()
-			.select(T.name)
-			.where(T.name.isin(SurrealDB.from_(other).select(other.name).where(other.name == T.name))),
 			"sum of computed varchar": q().select(fn.Sum(fn.Concat(T.title, "x"))),
 			"compare computed string": q().select(T.name).where(fn.Concat(T.title, "x") == "a"),
 			"like on concat": q().select(T.name).where(fn.Concat(T.title, "x").like("a%")),
@@ -290,7 +289,9 @@ class TestSurrealDBTranslator(UnitTestCase):
 			# Revised P1.6d contract (upstream test_db parity): text-kind columns (Small Text / Text /
 			# Long / Medium) compare case-insensitively via an inline `string::lowercase()` on both
 			# sides, so a long text compare is supported; LIKE / ORDER BY / GROUP BY on them stay refused.
-			"string vs number": q().select(T.name).where(T.title == 5),
+			# patch_text_int_cmp (P2.1) casts an int through its canonical decimal string (`title = 1`), so
+			# the remaining string-vs-number boundary is a non-integer number (MariaDB casts the column)
+			"string vs non-integer number": q().select(T.name).where(T.title == 5.5),
 			"number vs bad string": q().select(T.name).where(T.qty == "abc"),
 			"regex": q().select(T.name).where(T.title.regex("a")),
 			"for update with group by": q().select(fn.Count("*")).groupby(T.flag).for_update(),
@@ -507,20 +508,16 @@ class TestSurrealDBTranslator(UnitTestCase):
 		)
 
 	def test_correlated_subqueries_still_fail_closed(self):
-		from pypika.terms import ExistsCriterion as Exists
-
 		dt, cf = Table("tabDocType"), Table("tabCustom Field")
-		# correlated IN/EXISTS need per-row truth, not a per-row value: still fail closed
-		issingle = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == cf.dt)
-		with self.assertRaises(SurrealDBNotImplementedError):
-			r(SurrealDB.from_(cf).select(cf.dt).where(Exists(issingle)))
-		# a reference to a query more than one level out is not bound
+		# a reference to a query more than one level out is not bound (correlated IN/EXISTS are supported
+		# since P1.13; see test_correlated_exists_answers_per_row)
 		other = Table("tabOther")
 		two_out = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == other.name)
 		mid = SurrealDB.from_(cf).select(two_out.as_("issingle"))
 		with self.assertRaises(SurrealDBNotImplementedError):
 			r(SurrealDB.from_(other).select(mid.as_("x")))
 		# a correlated sub-query at the outer level of an aggregate query cannot reach the row
+		issingle = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == cf.dt)
 		with self.assertRaises(SurrealDBNotImplementedError):
 			r(SurrealDB.from_(cf).select(cf.dt, issingle.as_("issingle")).groupby(cf.dt))
 		# long text has no collation shadow to compare with
@@ -641,6 +638,174 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertNotIn(evil, sql)
 		sql, _params = r(SurrealDB.into(T).columns("name", "title").insert(evil, evil))
 		self.assertNotIn("REMOVE", sql)
+
+	# --- P1.13: the six translation gaps surfaced by P2.1 ------------------------------------------------------------------
+	def test_const_left_in_subquery(self):
+		# `7 IN (SELECT ..)` - the note.py login check - meets the hoisted sub-query as a bound constant
+		other = Table("tabOther")
+		sql, params = r(q().select(T.name).where(ValueWrapper(7).isin(SurrealDB.from_(other).select(other.qty))))
+		self.assertIn("(SELECT VALUE `__c0` FROM (SELECT `qty` AS `__c0` FROM `tabOther`))", sql)
+		self.assertIn("WHERE ($param1 IN $sq1)", sql)
+		self.assertEqual(params.values, {"param1": 7})
+		# a varchar key meets the constant through its collation key
+		sql, params = r(q().select(T.name).where(ValueWrapper("note").isin(SurrealDB.from_(other).select(other.title))))
+		self.assertIn("(SELECT `title@ci` AS `__c0` FROM `tabOther`)", sql)
+		self.assertIn("WHERE ($param2 IN $sq1)", sql)
+		self.assertEqual(params.values["param2"], C.ci_key("note"))
+		# NOT IN stays exact: empty is true for everything, a NULL in the list makes it UNKNOWN
+		sql, _ = r(q().select(T.name).where(ValueWrapper(7).notin(SurrealDB.from_(other).select(other.qty))))
+		self.assertIn(
+			"(array::len($sq1) = 0 OR (NOT ($param1 IN $sq1) AND NOT (NULL IN $sq1) AND NOT (NONE IN $sq1)))", sql
+		)
+		# `NULL IN (..)` is UNKNOWN: never true, and its negation over a non-empty list as well
+		sql, _ = r(q().select(T.name).where(ValueWrapper(None).isin(SurrealDB.from_(other).select(other.qty))))
+		self.assertIn("WHERE false", sql)
+
+	def test_const_left_in_a_tuple_folds_like_mariadb(self):
+		# literal elements fold (strings meet under the *_ci collation); a NULL element is UNKNOWN
+		sql, _ = r(q().select(T.name).where(ValueWrapper("b").isin(Tuple("a", "B", "c"))))
+		self.assertIn("WHERE true", sql)
+		sql, _ = r(q().select(T.name).where(ValueWrapper("b").notin(Tuple("a", "c"))))
+		self.assertIn("WHERE true", sql)
+		sql, _ = r(q().select(T.name).where(ValueWrapper("b").isin(Tuple("a", None))))
+		self.assertIn("WHERE false", sql)
+		# an element that is a column is one membership comparison
+		sql, params = r(q().select(T.name).where(ValueWrapper("b").isin(Tuple("a", T.title))))
+		self.assertIn("WHERE ((`title@ci` = $param1))", sql)
+		self.assertEqual(params.values, {"param1": C.ci_key("b")})
+		sql, _ = r(q().select(T.name).where(ValueWrapper("b").notin(Tuple("a", T.title))))
+		self.assertIn("WHERE ((`title@ci` != NULL AND `title@ci` != NONE AND `title@ci` != $param1))", sql)
+
+	def test_field_function(self):
+		# constants fold like MariaDB (case-insensitive strings, numbers coerce strings)
+		sql, params = r(q().select(Function("FIELD", "b", "a", "B", "c").as_("rank")))
+		self.assertEqual(params.values, {"param1": 2})
+		sql, params = r(q().select(Function("FIELD", T.title, "a", "b")))
+		self.assertEqual(
+			sql,
+			"SELECT IF (`title@ci` = $param1) THEN 1 ELSE IF (`title@ci` = $param2) THEN 2 ELSE 0 END AS `__c0` "
+			'FROM `tabDoc` /*cols:__c0*/ /*names:["FIELD(`title`,\'a\',\'b\')"]*/ /*kinds:bigint*/',
+		)
+		self.assertEqual(params.values["param1"], C.ci_key("a"))
+		# FIELD in ORDER BY is a number, so it needs no collation shadow
+		sql, _ = r(q().select(T.name).orderby(Function("FIELD", T.title, "a", "b")))
+		self.assertIn(
+			"IF (`title@ci` = $param1) THEN 1 ELSE IF (`title@ci` = $param2) THEN 2 ELSE 0 END AS `__o0` "
+			"FROM `tabDoc` ORDER BY `__o0` ASC",
+			sql,
+		)
+
+	def test_comma_join_becomes_inner_join_steps(self):
+		# Frappe's legacy comma join: the cross-table equality conjuncts are the ON of the join steps
+		other = Table("tabOther")
+		sql, _ = r(SurrealDB.from_(T).from_(other).select(T.name, other.title).where(T.title == other.title))
+		self.assertIn(
+			"FROM (array::flatten(array::map((SELECT VALUE { `t0`: $this } FROM `tabDoc`), |$r| "
+			"(SELECT VALUE { `t0`: $r.`t0`, `t1`: $this } FROM `tabOther` WHERE "
+			"($r.`t0`.`title@ci` != NULL AND $r.`t0`.`title@ci` != NONE AND `title@ci` != NULL AND "
+			"`title@ci` != NONE AND $r.`t0`.`title@ci` = `title@ci`)))))",
+			sql,
+		)
+		# a conjunct of the first table alone is applied before joining, the rest is consumed
+		dt = Table("tabDocType")
+		sql, params = r(
+			SurrealDB.from_(T)
+			.from_(other)
+			.from_(dt)
+			.select(T.name)
+			.where((T.title == other.title) & (other.qty == dt.issingle) & (T.flag == 1))
+		)
+		self.assertIn("(SELECT VALUE { `t0`: $this } FROM `tabDoc` WHERE (`flag` = $param1))", sql)
+		self.assertIn("|$r| (SELECT VALUE { `t0`: $r.`t0`, `t1`: $this } FROM `tabOther`", sql)
+		self.assertIn("|$r| (SELECT VALUE { `t0`: $r.`t0`, `t1`: $r.`t1`, `t2`: $this } FROM `tabDocType`", sql)
+		self.assertEqual(params.values, {"param1": 1})
+		# a table without an equality to connect it, or a comma join mixed with JOIN ... ON, fails closed
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(T).from_(other).from_(dt).select(T.name).where(T.title == other.title))
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(T).from_(other).join(dt).on(T.name == dt.name).select(T.name))
+
+	def test_distinct_with_the_pk_is_a_noop(self):
+		# every output row is one record: no dedup, no GROUP BY, no sorting
+		sql, _ = r(q().select(T.name).distinct())
+		self.assertEqual(sql, "SELECT `name` FROM `tabDoc` /*cols:name*/ /*kinds:varchar*/")
+		sql, _ = r(q().select(T.name, T.title).distinct())
+		self.assertEqual(sql, "SELECT `name`, `title` FROM `tabDoc` /*cols:name,title*/ /*kinds:varchar,varchar*/")
+		sql, _ = r(q().select("*").distinct())
+		self.assertIn("SELECT `name`, `creation`, `title`", sql)
+		# a projection without the key still deduplicates through GROUP BY
+		sql, _ = r(q().select(T.title).distinct())
+		self.assertIn("GROUP BY `__k1`", sql)
+
+	def test_order_by_a_select_alias(self):
+		# MariaDB resolves ORDER BY names against the projection first (pypika qualifies a string
+		# order_by with the FROM table)
+		sql, _ = r(q().select(T.name.as_("who")).orderby("who").limit(3))
+		self.assertEqual(
+			sql,
+			"SELECT `name` AS `who`, `name@ci` AS `__o0` FROM `tabDoc` ORDER BY `__o0` ASC LIMIT 3 "
+			"/*cols:who*/ /*kinds:varchar*/",
+		)
+		# the alias of an aggregate in an aggregate query: the outer level orders by the aggregate
+		sql, _ = r(q().select(fn.Count(T.name).as_("count")).groupby(T.flag).orderby("count"))
+		self.assertIn(
+			"SELECT `__a2` AS `__c0`, `__a2` AS `__o0` FROM "
+			"(SELECT `flag` AS `__k1`, count(`name` != NULL AND `name` != NONE) AS `__a2` FROM `tabDoc` "
+			"GROUP BY `__k1`) ORDER BY `__o0` ASC",
+			sql,
+		)
+
+	def test_correlated_exists_answers_per_row(self):
+		dt, cf = Table("tabDocType"), Table("tabCustom Field")
+		issingle = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == cf.dt)
+		sql, _ = r(SurrealDB.from_(cf).select(cf.dt).where(Exists(issingle)))
+		self.assertIn(
+			"(array::map([{`k1`: `dt@ci`, `k1l`: `dt@like`}], |$o| array::len((SELECT VALUE `__c0` FROM "
+			"(SELECT `issingle` AS `__c0` FROM `tabDocType` WHERE (`name@ci` != NULL AND `name@ci` != NONE "
+			"AND $o.`k1` != NULL AND $o.`k1` != NONE AND `name@ci` = $o.`k1`))))))[0] > 0",
+			sql,
+		)
+		sql, _ = r(SurrealDB.from_(cf).select(cf.dt).where(~Exists(issingle)))
+		self.assertIn("))))[0] = 0", sql)
+
+	def test_correlated_in_answers_per_row(self):
+		dt = Table("tabDocType")
+		linked = SurrealDB.from_(dt).select(dt.issingle).where(dt.is_virtual == T.qty)
+		sql, _ = r(q().select(T.name).where(T.qty.isin(linked)))
+		self.assertIn(
+			"(array::map([{`k1`: `qty`, `k2`: `qty`}], |$o| ($o.`k2` != NULL AND $o.`k2` != NONE AND "
+			"$o.`k2` IN (SELECT VALUE `__c0` FROM (SELECT `issingle` AS `__c0` FROM `tabDocType` WHERE "
+			"(`is_virtual` != NULL AND `is_virtual` != NONE AND $o.`k1` != NULL AND $o.`k1` != NONE "
+			"AND `is_virtual` = $o.`k1`))))))[0]",
+			sql,
+		)
+		# a varchar left operand is carried with its collation key, so the match is case-insensitive
+		cf = Table("tabCustom Field")
+		sql, _ = r(
+			q().select(T.name).where(T.title.isin(SurrealDB.from_(cf).select(cf.fieldname).where(cf.dt == T.title)))
+		)
+		self.assertIn(
+			"[{`k1`: `title@ci`, `k1l`: `title@like`, `k2`: `title@ci`, `k2l`: `title@like`}], |$o| "
+			"($o.`k2` != NULL AND $o.`k2` != NONE AND $o.`k2` IN (SELECT VALUE `__c0` FROM "
+			"(SELECT `fieldname@ci` AS `__c0`",
+			sql,
+		)
+		# a constant needle is bound and needs no binding of its own
+		sql, params = r(
+			q()
+			.select(T.name)
+			.where(ValueWrapper(3).isin(SurrealDB.from_(dt).select(dt.issingle).where(dt.is_virtual == T.qty)))
+		)
+		self.assertIn("(array::map([{`k1`: `qty`}], |$o| ($param1 IN (SELECT VALUE `__c0` FROM", sql)
+		self.assertEqual(params.values, {"param1": 3})
+
+	def test_varchar_column_meets_an_int_like_mariadb(self):
+		# patch_text_int_cmp (P2.1, official-run blocker #3): the Property Setter's `value = 1` shape
+		sql, params = r(q().select(T.name).where(T.title == 5))
+		self.assertEqual(
+			sql, "SELECT `name` FROM `tabDoc` WHERE (`title@ci` = $param1) /*cols:name*/ /*kinds:varchar*/"
+		)
+		self.assertEqual(params.values, {"param1": C.ci_key("5")})
 
 	def test_frappe_parameter_wrapper_is_used(self):
 		from frappe.query_builder.terms import NamedParameterWrapper

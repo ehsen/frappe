@@ -814,18 +814,24 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 			self.both(label, build, failures)
 		self.report(failures, "EXISTS cases")
 
-	def test_correlated_subquery_fails_closed(self):
-		from frappe.database.surrealdb.errors import SurrealDBNotImplementedError
-
+	def test_correlated_in_answers_per_row(self):
+		# P1.13: a correlated IN renders per-row (`array::map` carries the outer value) instead of failing
+		# closed (P1.6c); the NULL guards keep MariaDB's three-valued logic, so this is live parity now.
 		p, k = T, K
-		# correlated IN needs a per-row truth value, not a per-row value: still fail closed (P1.6c)
-		query = (
-			SurrealDB.from_(p)
+		cases = {
+			"correlated IN": lambda Q: Q.from_(p)
 			.select(p.name)
-			.where(p.name.isin(SurrealDB.from_(k).select(k.parent).where(k.parent == p.name)))
-		)
-		with self.assertRaises(SurrealDBNotImplementedError):
-			render(query, None, self.loader)
+			.where(p.name.isin(Q.from_(k).select(k.parent).where(k.parent == p.name)))
+			.orderby(p.name),
+			"correlated IN over a varchar": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(p.title.isin(Q.from_(k).select(k.item).where(k.item == p.title)))
+			.orderby(p.name),
+		}
+		failures = []
+		for label, build in cases.items():
+			self.both(label, build, failures)
+		self.report(failures, "correlated sub-query cases")
 
 	def test_correlated_scalar_subquery(self):
 		# P1.6c: a scalar sub-query that reads the outer row is evaluated once per row (the `issingle` shape of
