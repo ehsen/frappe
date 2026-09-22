@@ -818,6 +818,7 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 		from frappe.database.surrealdb.errors import SurrealDBNotImplementedError
 
 		p, k = T, K
+		# correlated IN needs a per-row truth value, not a per-row value: still fail closed (P1.6c)
 		query = (
 			SurrealDB.from_(p)
 			.select(p.name)
@@ -825,6 +826,43 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 		)
 		with self.assertRaises(SurrealDBNotImplementedError):
 			render(query, None, self.loader)
+
+	def test_correlated_scalar_subquery(self):
+		# P1.6c: a scalar sub-query that reads the outer row is evaluated once per row (the `issingle` shape of
+		# get_link_fields). The kid rows carry case-variant, misspelled and NULL parents, so this also checks the
+		# collation-shadow comparison and the NULL/empty semantics against MariaDB.
+		p, k = T, K
+		cases = {
+			"kids per parent": lambda Q: Q.from_(p)
+			.select(p.name, Q.from_(k).select(fn.Count("*")).where(k.parent == p.name).as_("nk"))
+			.orderby(p.name),
+			"max kid idx per parent": lambda Q: Q.from_(p)
+			.select(p.name, Q.from_(k).select(fn.Max(k.idx)).where(k.parent == p.name).as_("mx"))
+			.orderby(p.name),
+			"max kid qty per parent": lambda Q: Q.from_(p)
+			.select(p.name, Q.from_(k).select(fn.Max(k.qty)).where(k.parent == p.name).as_("mq"))
+			.orderby(p.name),
+			"correlated plus uncorrelated conjunct": lambda Q: Q.from_(p)
+			.select(
+				p.name,
+				Q.from_(k)
+				.select(fn.Count("*"))
+				.where((k.parent == p.name) & (k.idx > 2))
+				.as_("nk"),
+			)
+			.orderby(p.name),
+			"correlated scalar in where": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(p.qty > Q.from_(k).select(fn.Max(k.idx)).where(k.parent == p.name))
+			.orderby(p.name),
+			"correlated scalar on another column": lambda Q: Q.from_(p)
+			.select(p.name, Q.from_(k).select(fn.Max(k.idx)).where(k.item == p.title).as_("mi"))
+			.orderby(p.name),
+		}
+		failures = []
+		for label, build in cases.items():
+			self.both(label, build, failures)
+		self.report(failures, "correlated scalar sub-query cases")
 
 	# --- upserts on a system table ---------------------------------------------------------------------------------------------
 	def test_upsert_system_table(self):

@@ -9,3 +9,5 @@ Integrations
 Printing
 Contacts
 Automation
+OtherModule
+RemoveThis

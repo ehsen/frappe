@@ -30,25 +30,40 @@ def col(fieldtype, fieldname, **kw):
 
 
 def make_schema(table="tabDoc"):
-	specs = [
-		S.ColumnSpec("name", "varchar(140)", nullable=False),
-		S.ColumnSpec("creation", "datetime(6)"),
-		col("Data", "title"),
-		col("Data", "select"),
-		col("Int", "qty", not_nullable=1),
-		col("Duration", "amount"),
-		col("Date", "day"),
-		col("Datetime", "stamp"),
-		col("Time", "at"),
-		col("Long Text", "notes"),
-		col("Check", "flag"),
-		col("Data", "note"),
-	]
+	if table == "tabDocType":
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Check", "issingle"),
+			col("Int", "is_virtual"),
+		]
+	elif table == "tabCustom Field":
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Data", "dt"),
+			col("Data", "fieldname"),
+			col("Data", "options"),
+			col("Check", "is_virtual"),
+		]
+	else:
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			S.ColumnSpec("creation", "datetime(6)"),
+			col("Data", "title"),
+			col("Data", "select"),
+			col("Int", "qty", not_nullable=1),
+			col("Duration", "amount"),
+			col("Date", "day"),
+			col("Datetime", "stamp"),
+			col("Time", "at"),
+			col("Long Text", "notes"),
+			col("Check", "flag"),
+			col("Data", "note"),
+		]
 	return S.TableSchema(table, {s.name: s for s in specs}, {})
 
 
 def loader(name):
-	if name not in ("tabDoc", "tabOther"):
+	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field"):
 		raise SurrealDBProgrammingError(1146, f"Table '{name}' doesn't exist")
 	return make_schema(name)
 
@@ -91,6 +106,18 @@ class TestSurrealDBTranslator(UnitTestCase):
 		sql, params = r(q().select(T.name).where(T.title == "Résumé  "))
 		self.assertIn("WHERE (`title@ci` = $param1)", sql)
 		self.assertEqual(params.values, {"param1": C.ci_key("resume")})
+
+	def test_text_columns_compare_case_insensitively_inline(self):
+		# Revised P1.6d contract: text-kind columns (including Long Text) compare with an inline
+		# `string::lowercase()` on both sides - upstream test_db compares them directly. The stored
+		# side is NULL-guarded: SurrealDB's string::lowercase(NULL) raises while MariaDB yields NULL.
+		sql, params = r(q().select(T.name).where(T.notes == "X"))
+		self.assertIn(
+			"WHERE (IF `notes` = NULL OR `notes` = NONE THEN NULL ELSE (string::lowercase(`notes`)) END "
+			"= string::lowercase($param1))",
+			sql,
+		)
+		self.assertEqual(params.values, {"param1": "X"})
 
 	def test_null_guards_on_everything_but_equality(self):
 		cases = {
@@ -260,7 +287,9 @@ class TestSurrealDBTranslator(UnitTestCase):
 			"sum distinct": q().select(fn.Sum(T.qty).distinct()),
 			"sum of varchar": q().select(fn.Sum(T.title)),
 			"group by long text": q().select(T.notes, fn.Count("*")).groupby(T.notes),
-			"long text compare": q().select(T.name).where(T.notes == "x"),
+			# Revised P1.6d contract (upstream test_db parity): text-kind columns (Small Text / Text /
+			# Long / Medium) compare case-insensitively via an inline `string::lowercase()` on both
+			# sides, so a long text compare is supported; LIKE / ORDER BY / GROUP BY on them stay refused.
 			"string vs number": q().select(T.name).where(T.title == 5),
 			"number vs bad string": q().select(T.name).where(T.qty == "abc"),
 			"regex": q().select(T.name).where(T.title.regex("a")),
@@ -394,6 +423,110 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertIn("array::len($sq1) = 0 OR", sql)
 		self.assertIn("NOT (NULL IN $sq1) AND NOT (NONE IN $sq1)", sql)
 
+	def test_uncorrelated_scalar_subquery_in_projection_is_hoisted(self):
+		dt = Table("tabDocType")
+		sql, _ = r(SurrealDB.from_(dt).select(SurrealDB.from_(Table("tabOther")).select(fn.Count("*"))))
+		self.assertTrue(sql.startswith("LET $sq1 = (SELECT VALUE `__c0` FROM ("), sql)
+		self.assertIn(
+			"SELECT IF array::len($sq1) = 0 THEN 0 ELSE array::first($sq1) END AS `__c0` FROM `tabDocType`", sql
+		)
+
+	def test_correlated_scalar_subquery_in_projection(self):
+		# `get_link_fields`'s shape: the sub-query reads `cf.dt`, a column of the outer row (chunk P1.6c)
+		dt, cf = Table("tabDocType"), Table("tabCustom Field")
+		issingle = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == cf.dt)
+		sql, params = r(
+			SurrealDB.from_(cf)
+			.select(cf.dt.as_("parent"), cf.fieldname, issingle.as_("issingle"))
+			.where(cf.options == "Note")
+		)
+		self.assertIn(
+			"SELECT `dt` AS `parent`, `fieldname`, (array::map([{`k1`: `dt@ci`, `k1l`: `dt@like`}], |$o| "
+			"(SELECT VALUE `__c0` FROM (SELECT `issingle` AS `__c0` FROM `tabDocType` WHERE "
+			"(`name@ci` != NULL AND `name@ci` != NONE AND $o.`k1` != NULL AND $o.`k1` != NONE "
+			"AND `name@ci` = $o.`k1`)))[0]))[0] AS `__c2` FROM `tabCustom Field`",
+			sql,
+		)
+		# the outer row's varchar column contributes its collation key, so the match is case-insensitive;
+		# the uncorrelated conjunct keeps its bound parameter
+		sql, params = r(
+			SurrealDB.from_(cf)
+			.select(cf.dt, issingle.as_("issingle"))
+			.where((cf.options == "Note") & (cf.is_virtual == 0))
+		)
+		self.assertIn("(array::map([{`k1`: `dt@ci`, `k1l`: `dt@like`}],", sql)
+		self.assertIn("WHERE ((`options@ci` = $param1) AND (`is_virtual` = $param2))", sql)
+		self.assertEqual(params.values, {"param1": C.ci_key("Note"), "param2": 0})
+
+	def test_correlated_scalar_subquery_binds_two_columns(self):
+		dt, cf = Table("tabDocType"), Table("tabCustom Field")
+		issingle = SurrealDB.from_(dt).select(dt.issingle).where((dt.name == cf.dt) & (dt.is_virtual == cf.is_virtual))
+		sql, _ = r(SurrealDB.from_(cf).select(issingle.as_("issingle")))
+		self.assertIn("(array::map([{`k1`: `dt@ci`, `k1l`: `dt@like`, `k2`: `is_virtual`}],", sql)
+		self.assertIn("`name@ci` = $o.`k1`", sql)
+		self.assertIn("`is_virtual` = $o.`k2`", sql)
+
+	def test_correlated_scalar_subquery_like_over_the_outer_column(self):
+		dt, cf = Table("tabDocType"), Table("tabCustom Field")
+		issingle = SurrealDB.from_(dt).select(dt.issingle).where(cf.dt.like("a%"))
+		sql, _ = r(SurrealDB.from_(cf).select(issingle.as_("issingle")))
+		self.assertIn(
+			"($o.`k1l` != NULL AND $o.`k1l` != NONE AND string::matches($o.`k1l`, $param1))", sql
+		)
+
+	def test_min_max_over_nullable_numbers_skips_null_exactly(self):
+		# `math::max` skips NULLs in a mixed group, but errors on a stored NULL and answers -inf/+inf when every
+		# value of the group is NULL/NONE; MariaDB answers NULL - so collect, drop and take an end of the sort (P1.6c)
+		sql, _ = r(q().select(fn.Min(T.amount), fn.Max(T.amount)))
+		self.assertIn("array::group(`amount`) AS `__a1`, array::group(`amount`) AS `__a2`", sql)
+		self.assertIn(
+			"array::first(array::sort(array::complement(`__a1`, [NULL, NONE]))) AS `__c0`", sql
+		)
+		self.assertIn(
+			"array::last(array::sort(array::complement(`__a2`, [NULL, NONE]))) AS `__c1`", sql
+		)
+
+	def test_scalar_count_subquery_is_zero_for_an_empty_set(self):
+		# MariaDB answers one row (0) for COUNT over an empty set; SurrealDB's GROUP ALL returns none over no
+		# records, so a scalar COUNT sub-query needs the default (P1.6c)
+		dt, cf = Table("tabDocType"), Table("tabCustom Field")
+		nk = SurrealDB.from_(dt).select(fn.Count("*")).where(dt.name == cf.dt)
+		sql, _ = r(SurrealDB.from_(cf).select(cf.dt, nk.as_("nk")))
+		self.assertIn(
+			"(array::map([{`k1`: `dt@ci`, `k1l`: `dt@like`}], |$o| { LET $sq1 = "
+			"(SELECT VALUE `__c0` FROM (SELECT `__a1` AS `__c0` FROM (SELECT count() AS `__a1` FROM `tabDocType` "
+			"WHERE (`name@ci` != NULL AND `name@ci` != NONE AND $o.`k1` != NULL AND $o.`k1` != NONE "
+			"AND `name@ci` = $o.`k1`) GROUP ALL))); IF array::len($sq1) = 0 { 0 } ELSE { array::first($sq1) } }))[0]",
+			sql,
+		)
+		# uncorrelated: the hoisted `LET` runs once, the default lives in the statement
+		other = Table("tabOther")
+		sql, _ = r(q().select(SurrealDB.from_(other).select(fn.Count("*")).where(other.qty > 3)))
+		self.assertIn(
+			"SELECT IF array::len($sq1) = 0 THEN 0 ELSE array::first($sq1) END AS `__c0` FROM `tabDoc`", sql
+		)
+
+	def test_correlated_subqueries_still_fail_closed(self):
+		from pypika.terms import ExistsCriterion as Exists
+
+		dt, cf = Table("tabDocType"), Table("tabCustom Field")
+		# correlated IN/EXISTS need per-row truth, not a per-row value: still fail closed
+		issingle = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == cf.dt)
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(cf).select(cf.dt).where(Exists(issingle)))
+		# a reference to a query more than one level out is not bound
+		other = Table("tabOther")
+		two_out = SurrealDB.from_(dt).select(dt.issingle).where(dt.name == other.name)
+		mid = SurrealDB.from_(cf).select(two_out.as_("issingle"))
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(other).select(mid.as_("x")))
+		# a correlated sub-query at the outer level of an aggregate query cannot reach the row
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(cf).select(cf.dt, issingle.as_("issingle")).groupby(cf.dt))
+		# long text has no collation shadow to compare with
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(q().select(SurrealDB.from_(dt).select(dt.issingle).where(dt.name == T.notes)))
+
 	def test_functions_render(self):
 		sql, _ = r(q().select(fn.IfNull(T.note, T.title), fn.Coalesce(T.title, "z")))
 		self.assertIn("(`note` ?? `title`) AS `__c0`", sql)
@@ -414,6 +547,34 @@ class TestSurrealDBTranslator(UnitTestCase):
 		# `IFNULL(number, '')` is the "is not set" idiom: only comparable with ''
 		sql, _ = r(q().select(T.name).where(fn.IfNull(T.qty, "") == ""))
 		self.assertIn("IF `qty` != NULL AND `qty` != NONE THEN 'x' ELSE $param1 END = $param2", sql)
+
+	def test_concat_ws(self):
+		# get_user_fullname's idiom: `CONCAT_WS(' ', first_name, last_name)` — a plain string projection
+		sql, params = r(q().select(qf.Concat_ws(" ", T.name, T.title).as_("fullname")))
+		self.assertEqual(
+			sql,
+			"SELECT string::concat($param1, IF `name` = NULL OR `name` = NONE THEN '' ELSE `name` END, "
+			"IF `title` = NULL OR `title` = NONE THEN '' ELSE `title` END) AS `__c0` FROM `tabDoc` "
+			'/*cols:__c0*/ /*names:["fullname"]*/ /*kinds:varchar*/',
+		)
+		self.assertEqual(params.values, {"param1": " "})
+		# MariaDB skips NULL values (SurrealDB's string::concat would print them as 'NULL'), so every value
+		# part carries a NULL/NONE guard; ints are cast, dates/times/long text join as their stored text
+		sql, params = r(q().select(qf.Concat_ws("-", T.qty, T.day, T.notes, "z", 5)))
+		self.assertIn(
+			"string::concat($param1, IF `qty` = NULL OR `qty` = NONE THEN '' ELSE <string>`qty` END, "
+			"IF `day` = NULL OR `day` = NONE THEN '' ELSE `day` END, "
+			"IF `notes` = NULL OR `notes` = NONE THEN '' ELSE `notes` END, $param2, $param3) AS `__c0`",
+			sql,
+		)
+		self.assertEqual(params.values, {"param1": "-", "param2": "z", "param3": "5"})
+		# a NULL separator is NULL and `CONCAT_WS(sep)` without values is ''
+		self.assertIn("SELECT NULL AS `__c0`", r(q().select(qf.Concat_ws(None, T.title, "x")))[0])
+		self.assertIn("SELECT string::concat($param1) AS `__c0`", r(q().select(qf.Concat_ws(",")))[0])
+		# fail closed: a column separator and MariaDB's own number formatting are not reproduced
+		for query in (q().select(T.name).where(qf.Concat_ws(T.title, T.name) == "a"), q().select(qf.Concat_ws(",", T.amount, "x"))):
+			with self.assertRaises(SurrealDBNotImplementedError):
+				r(query)
 
 	def test_now_is_one_bound_value(self):
 		sql, params = r(q().select(T.name).where((fn.Now() > T.stamp) & (fn.Now() < "2100-01-01")))

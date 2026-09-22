@@ -112,8 +112,13 @@ class TestSurrealDBDriver(UnitTestCase):
 		self.assertIs(params["a"], C.SNULL)
 		self.assertIs(params["b"][1], C.SNULL)
 		self.assertEqual(params["c"], "x")
-		with self.assertRaises(E.SurrealDBProgrammingError):
-			db.sql("SELECT * FROM t WHERE a = %s", (1,))
+		# Revised P1.3 contract (upstream test_db parity): printf-style positional parameters bind as
+		# `$pN` - every value stays bound, never interpolated into the text; temporal positional values
+		# encode canonically (no column context in raw sql), while *named* temporal values stay refused.
+		db.sql("SELECT * FROM t WHERE a = %s", (1,))
+		last = queries(server)[-1]
+		self.assertIn("$p0", last[1])
+		self.assertEqual(last[2], {"p0": 1})
 
 	def test_temporal_values_are_refused(self):
 		import datetime

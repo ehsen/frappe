@@ -344,6 +344,11 @@ class TestDB(IntegrationTestCase):
 				"FORTRAN",
 				"STABLE",
 			],
+			"surrealdb": [
+				# SurrealQL keywords as docfield names: the SurrealDB driver quotes every
+				# identifier, so clause keywords resolve as ordinary field names.
+				"PERMISSIONS",
+			],
 		}
 		created_docs = []
 
