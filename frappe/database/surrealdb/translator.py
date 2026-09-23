@@ -492,6 +492,12 @@ class Renderer:
 			return "num"
 		if e.kind == "varchar":
 			return "str"
+		if e.kind in ("text", "json"):
+			# P1.15: an allow-listed (ready) text column is a first-class string; unshadowed text/json
+			# stays "long" (no collation shadow - comparisons refuse)
+			if e.spec is not None and e.spec.has_collation_shadow:
+				return "str"
+			return "long"
 		if e.kind in TEMPORAL_KINDS:
 			return e.kind
 		if e.kind == "uuid":
@@ -631,8 +637,10 @@ class Renderer:
 			and args[1].const == ""
 			and not first.is_const
 			and first.kind in ("text", "json")
+			and not (first.spec is not None and first.spec.has_collation_shadow)
 		):
-			# stays a long-text value; only its emptiness can be tested (`_compare`)
+			# stays a long-text value; only its emptiness can be tested (`_compare`) - a SHADOWED text
+			# column goes through _unify instead, where IFNULL(col, '') gets full collation semantics
 			return Expr(f"({first.sql} ?? {self.params.add('')})", first.spec)
 		if (
 			len(args) == 2
@@ -952,8 +960,9 @@ class Renderer:
 		spec = e.spec
 		if spec is None:
 			unsupported("comparing constants", "P1.6")
-		if spec.is_varchar:
-			# patch_text_int_cmp (official-run blocker #3) (varchar)
+		if spec.has_collation_shadow:
+			# patch_text_int_cmp (official-run blocker #3) (varchar or allow-listed text: the constant
+			# binds through its collation key)
 			if isinstance(value, float | Decimal):
 				unsupported(
 					"comparing a string column with a non-integer number (MariaDB converts the column to a number)",
@@ -995,6 +1004,11 @@ class Renderer:
 				unsupported(f"an invalid {spec.kind} literal ({e_})", "P1.6")
 			return e.sql, self.params.add(encoded)
 		if spec.kind == "text":
+			if spec.has_collation_shadow:  # pragma: no cover - the collation branch above owns these
+				unsupported(
+					"a shadowed text column reached the inline lowercase path (invariant: one collation representation)",
+					"P1.15",
+				)
 			# Text columns (Small Text/Text/Long/Medium - they share the `text` kind) have no collation
 			# shadow - only varchar columns get one - but their comparisons are ASCII in practice.
 			# Approximate MariaDB's *_ci collation with an inline case-fold on both sides; NULL never
@@ -1088,11 +1102,13 @@ class Renderer:
 			if (
 				left.spec is not None
 				and left.spec.kind in ("text", "json")
+				and not left.spec.has_collation_shadow
 				and isinstance(right.const, str)
 				and op in ("=", "!=")
 				and collation.equals_empty(right.const)
 			):
-				# "is set" / "is not set" on long text: exact without a shadow (see collation.empty_pattern)
+				# "is set" / "is not set" on UNshadowed long text: exact without a shadow (see
+				# collation.empty_pattern) - a shadowed column takes the @ci path below, like varchars
 				matches = f"string::matches({left.sql}, {self.params.add(collation.empty_pattern())})"
 				present = self._guard(left.sql)
 				return f"({present} AND {matches})" if op == "=" else f"({present} AND NOT ({matches}))"
@@ -1109,11 +1125,7 @@ class Renderer:
 			unsupported(f"comparing a {a.kind} value with a {b.kind} value", "P1.6")
 		if a.opaque_string or b.opaque_string:
 			unsupported("comparing IFNULL(non-string, '') with a column", P1_6C)
-		if fa == "str" and a.kind == "varchar" and b.kind == "varchar":
-			if a.ci is None or b.ci is None:
-				unsupported(
-					"comparing a computed string (its collation key cannot be computed in SurrealQL)", P1_6C
-				)
+		if fa == "str" and a.ci is not None and b.ci is not None:
 			ra, rb = a.ci, b.ci
 		elif fa == "str" and not (a.kind == b.kind == "uuid"):
 			unsupported(f"comparing a {a.kind} value with a {b.kind} value", "P1.6")
@@ -1126,8 +1138,10 @@ class Renderer:
 		is_literal, pattern = self._literal(term.right)
 		if left.is_const or not is_literal or not isinstance(pattern, str):
 			unsupported("LIKE with a pattern that is not a string constant", "P1.6")
-		if not left.spec.is_varchar:
-			unsupported(f"LIKE on a {left.spec.logical} column (needs a shadow: long text)", "P1.6")
+		if not left.spec.has_collation_shadow:
+			unsupported(
+				f"LIKE on a {left.spec.logical} column (not in the text-collation-shadow allow-list)", "P1.6"
+			)
 		if left.like is None or left.opaque_string:
 			unsupported(
 				"LIKE on a computed string (its collation shadow cannot be computed in SurrealQL)", P1_6C
@@ -1239,10 +1253,10 @@ class Renderer:
 		fa = self._family(left)
 		if fa != self._family(Expr(None, spec)) or fa == "long":
 			unsupported("IN (sub-query) over columns of different types", P1_6C)
-		varchar_key = fa == "str" and spec.is_varchar
+		varchar_key = fa == "str" and spec.has_collation_shadow
 		name = None if child.correlated.bound else self._hoist(rows)
 		if not left.is_const:
-			if fa == "str" and not (left.ci is not None and spec.is_varchar):
+			if fa == "str" and not (left.ci is not None and spec.has_collation_shadow):
 				unsupported("IN (sub-query) over a computed string", P1_6C)
 			if left.opaque_string:
 				unsupported("IN (sub-query) over IFNULL(non-string, '')", P1_6C)
@@ -1660,7 +1674,7 @@ class Renderer:
 		(names repeat across joined tables and expressions have none), with the display name in the `/*names:*/` hint."""
 		e = self._materialize(e)
 		sql = e.sql
-		if self._key_projection and index == 0 and e.spec.is_varchar:
+		if self._key_projection and index == 0 and e.spec.has_collation_shadow:
 			if e.ci is None:
 				unsupported(
 					"a computed string used as a sub-query key (its collation key cannot be computed)", P1_6C
@@ -1726,9 +1740,11 @@ class Renderer:
 		e = self.expr(field)
 		if e.is_const:
 			unsupported("ORDER BY a constant", "P1.6")
-		if e.kind in ("text", "json"):
-			unsupported(f"ORDER BY a {e.spec.logical} column", "P1.6")
-		if e.spec.is_varchar:
+		if e.kind in ("text", "json") and not (e.spec is not None and e.spec.has_collation_shadow):
+			unsupported(
+				f"ORDER BY a {e.spec.logical} column (not in the text-collation-shadow allow-list)", "P1.6"
+			)
+		if e.spec.has_collation_shadow:
 			if e.ci is None:
 				unsupported(
 					"ORDER BY a computed string (its collation key cannot be computed in SurrealQL)", P1_6C
@@ -2013,10 +2029,12 @@ class Grouping:
 		with r._row_mode():
 			e = r.expr(term)
 		e = r._materialize(e) if e.is_const else e
-		if e.kind in ("text", "json"):
-			unsupported(f"GROUP BY a {e.spec.logical} value", "P1.6")
+		if e.kind in ("text", "json") and not (e.spec is not None and e.spec.has_collation_shadow):
+			unsupported(
+				f"GROUP BY a {e.spec.logical} value (not in the text-collation-shadow allow-list)", "P1.6"
+			)
 		i = self._id()
-		if e.spec.is_varchar:
+		if e.spec.has_collation_shadow:
 			if e.ci is None:
 				unsupported(
 					"GROUP BY a computed string (its collation key cannot be computed in SurrealQL)", P1_6C
@@ -2040,7 +2058,7 @@ class Grouping:
 			i = self._id()
 			self.inner.append(f"{e.sql} AS `__n{i}`")
 			out = Expr(f"array::first(`__n{i}`)", spec)
-			if spec.is_varchar:
+			if spec.has_collation_shadow:
 				self.inner += [f"{e.ci} AS `__n{i}c`", f"{e.like} AS `__n{i}l`"]
 				out.ci, out.like = f"array::first(`__n{i}c`)", f"array::first(`__n{i}l`)"
 			self.first[key] = out
@@ -2081,11 +2099,13 @@ class Grouping:
 			self.inner.append(f"count() AS `__a{i}`")
 			return Expr(f"`__a{i}`", _synthetic("bigint"))
 		if distinct:
-			if e.kind in ("text", "json"):
-				unsupported("COUNT(DISTINCT long text)", P1_6C)
-			if e.spec.is_varchar and e.ci is None:
+			if e.kind in ("text", "json") and not (e.spec is not None and e.spec.has_collation_shadow):
+				unsupported(
+					"COUNT(DISTINCT long text (not in the text-collation-shadow allow-list))", P1_6C
+				)
+			if e.spec.has_collation_shadow and e.ci is None:
 				unsupported("COUNT(DISTINCT computed string)", P1_6C)
-			self.inner.append(f"array::group({e.ci if e.spec.is_varchar else e.sql}) AS `__a{i}`")
+			self.inner.append(f"array::group({e.ci if e.spec.has_collation_shadow else e.sql}) AS `__a{i}`")
 			return Expr(
 				f"array::len(array::complement(array::distinct(`__a{i}`), [NULL, NONE]))",
 				_synthetic("bigint"),
@@ -2199,7 +2219,7 @@ class OuterScope:
 		e = self.host._col(ctx, spec)
 		self._n += 1
 		name = f"k{self._n}"
-		if spec.is_varchar:
+		if spec.has_collation_shadow:
 			self.bundle += [f"{quote(name)}: {e.ci}", f"{quote(name + 'l')}: {e.like}"]
 			ref = Expr(f"$o.{quote(name)}", spec, ci=f"$o.{quote(name)}", like=f"$o.{quote(name + 'l')}")
 		else:
@@ -2213,7 +2233,7 @@ class OuterScope:
 		under a fresh key (the sub-query's own references took k1..kN while it was rendered)."""
 		self._n += 1
 		name = f"k{self._n}"
-		if e.spec is not None and e.spec.is_varchar:
+		if e.spec is not None and e.spec.has_collation_shadow:
 			self.bundle += [f"{quote(name)}: {e.ci}", f"{quote(name + 'l')}: {e.like}"]
 			return Expr(f"$o.{quote(name)}", e.spec, ci=f"$o.{quote(name)}", like=f"$o.{quote(name + 'l')}")
 		self.bundle.append(f"{quote(name)}: {e.sql}")

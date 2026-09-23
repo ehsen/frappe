@@ -71,6 +71,16 @@ def make_schema(table="tabDoc"):
 			col("Data", "options"),
 			col("Check", "is_virtual"),
 		]
+	elif table == "tabParityKid":
+		text_sh = S.ColumnSpec("text_sh", "text")
+		text_sh.text_collation_shadow = True
+		text_sh.shadow_ready = True
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Data", "title"),
+			text_sh,
+			col("Long Text", "notes"),
+		]
 	else:
 		specs = [
 			S.ColumnSpec("name", "varchar(140)", nullable=False),
@@ -90,7 +100,7 @@ def make_schema(table="tabDoc"):
 
 
 def loader(name):
-	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field", "tabReport", "tabNote", "tabNote Seen By"):
+	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field", "tabReport", "tabNote", "tabNote Seen By", "tabParityKid"):
 		raise SurrealDBProgrammingError(1146, f"Table '{name}' doesn't exist")
 	return make_schema(name)
 
@@ -133,6 +143,76 @@ class TestSurrealDBTranslator(UnitTestCase):
 		sql, params = r(q().select(T.name).where(T.title == "Résumé  "))
 		self.assertIn("WHERE (`title@ci` = $param1)", sql)
 		self.assertEqual(params.values, {"param1": C.ci_key("resume")})
+
+	def test_shadowed_text_column_uses_the_stored_collation(self):
+		# P1.15: an allow-listed text column compares through its stored shadows, exactly like a
+		# varchar - one collation representation for every string operation (invariant §2).
+		K = Table("tabParityKid")
+		sql, params = r(SurrealDB.from_(K).select(K.name).where(K.text_sh == "Résumé"))
+		self.assertIn("WHERE (`text_sh@ci` = $param1)", sql)
+		self.assertEqual(params.values, {"param1": C.ci_key("resume")})
+		sql, params = r(SurrealDB.from_(K).select(K.name).where(K.text_sh == ""))  # emptiness through the key
+		self.assertIn("WHERE (`text_sh@ci` = $param1)", sql)
+		self.assertEqual(params.values, {"param1": C.ci_key("")})
+		sql, _ = r(SurrealDB.from_(K).select(K.name).where(K.text_sh != "a"))
+		self.assertIn("(`text_sh@ci` != NULL AND `text_sh@ci` != NONE AND `text_sh@ci` != $param1)", sql)
+		sql, params = r(SurrealDB.from_(K).select(K.name).where(K.text_sh.isin(["a", "ß"])))
+		self.assertIn("`text_sh@ci` IN [$param1, $param2]", sql)
+		self.assertEqual(list(params.values.values()), [C.ci_key("a"), C.ci_key("ß")])
+
+	def test_shadowed_text_column_like_order_group(self):
+		K = Table("tabParityKid")
+		sql, params = r(SurrealDB.from_(K).select(K.name).where(K.text_sh.like("%traße%")))
+		self.assertIn("string::matches(`text_sh@like`, $param1)", sql)
+		sql, _ = r(SurrealDB.from_(K).select(K.name).orderby(K.text_sh))
+		self.assertIn("`text_sh@ci` AS `__o0`", sql)
+		self.assertIn("ORDER BY `__o0` ASC", sql)
+		sql, _ = r(SurrealDB.from_(K).select(K.text_sh, fn.Count("*")).groupby(K.text_sh))
+		self.assertIn("`text_sh@ci` AS `__k1`", sql)
+		self.assertIn("GROUP BY `__k1`", sql)
+		sql, _ = r(SurrealDB.from_(K).select(fn.Count(K.text_sh).distinct()))
+		self.assertIn("array::group(`text_sh@ci`)", sql)
+
+	def test_shadowed_text_ifnull_and_coalesce(self):
+		K = Table("tabParityKid")
+		sql, params = r(SurrealDB.from_(K).select(K.name).where(fn.IfNull(K.text_sh, "") == ""))
+		self.assertIn("`text_sh@ci`", sql)
+		sql, _ = r(SurrealDB.from_(K).select(K.name).where(fn.Coalesce(K.text_sh, "x") == "y"))
+		self.assertIn("`text_sh@ci`", sql)
+
+	def test_shadowed_text_mixed_with_unshadowed_raises(self):
+		K = Table("tabParityKid")
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(K).select(K.name).where(K.text_sh == K.notes))
+		with self.assertRaises(SurrealDBNotImplementedError):
+			r(SurrealDB.from_(K).select(fn.Coalesce(K.text_sh, K.notes)))
+
+	def test_unshadowed_text_like_order_group_still_fail_closed(self):
+		for label, query in {
+			"like": q().select(T.name).where(T.notes.like("%x%")),
+			"order by": q().select(T.name).orderby(T.notes),
+			"group by": q().select(T.notes, fn.Count("*")).groupby(T.notes),
+			"count distinct": q().select(fn.Count(T.notes).distinct()),
+		}.items():
+			with self.subTest(label), self.assertRaises(SurrealDBNotImplementedError) as cm:
+				r(query)
+			self.assertIn("not in the text-collation-shadow allow-list", str(cm.exception), label)
+
+	def test_pending_shadowed_text_raises_not_ready(self):
+		# P1.15 §4.4: with the integrity not established, every string-collation operation raises -
+		# there is no fallback to the inline lowercase path.
+		K = Table("tabParityKid")
+
+		def pending_loader(name):
+			if name != "tabParityKid":
+				return loader(name)
+			schema = make_schema(name)
+			schema.columns["text_sh"].shadow_ready = False
+			return schema
+
+		with self.assertRaises(SurrealDBNotImplementedError) as cm:
+			render(SurrealDB.from_(K).select(K.name).where(K.text_sh == "x"), None, pending_loader)
+		self.assertIn("text_sh collation shadows not ready (run bench migrate)", str(cm.exception))
 
 	def test_text_columns_compare_case_insensitively_inline(self):
 		# Revised P1.6d contract: text-kind columns (including Long Text) compare with an inline
