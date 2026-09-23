@@ -7,6 +7,7 @@ import frappe
 from frappe.database import get_db
 from frappe.database.surrealdb import connection as C
 from frappe.database.surrealdb import errors as E
+from frappe.database.surrealdb.database import SurrealDBDatabase
 from frappe.tests import UnitTestCase
 
 
@@ -380,3 +381,25 @@ class TestSurrealDBDriver(UnitTestCase):
 		self.assertEqual(C.last_statement_word("SELECT 1"), "select")
 		self.assertEqual(C.last_statement_word("LET $x = 'a;b'; CREATE t:1;"), "create")
 		self.assertEqual(C.last_statement_word("UPDATE t SET a = 'x;SELECT'; select 1"), "select")
+
+class TestEscape(UnitTestCase):
+	"""Chunk P1.3: frappe.db.escape returns a SurrealQL string literal (MariaDB escape parity)."""
+
+	def test_plain(self):
+		self.assertEqual(SurrealDBDatabase.escape("test@example.com"), "'test@example.com'")
+
+	def test_quote_and_backslash(self):
+		self.assertEqual(SurrealDBDatabase.escape("O'Brien \\ path"), "'O\\'Brien \\\\ path'")
+
+	def test_control_chars(self):
+		self.assertEqual(SurrealDBDatabase.escape("a\nb\tc\rd"), "'a\\nb\\tc\\rd'")
+
+	def test_percent_true_doubles_like_mariadb(self):
+		self.assertEqual(SurrealDBDatabase.escape("a%b"), "'a%%b'")
+
+	def test_percent_false_keeps_like_mariadb(self):
+		self.assertEqual(SurrealDBDatabase.escape("a%b", percent=False), "'a%b'")
+
+	def test_bytes_and_unicode_do_not_raise(self):
+		# frappe.tests.test_db.TestDB.test_escape parity: bytes input must not raise
+		self.assertEqual(SurrealDBDatabase.escape("香港濟生堂製藥有限公司 - IT".encode()), "'香港濟生堂製藥有限公司 - IT'")

@@ -392,7 +392,32 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 
 	@staticmethod
 	def escape(s, percent=True):
-		unsupported("string escaping (values must be bound, never interpolated)", "P1.3")
+		"""Escape a value for interpolation as a SurrealQL string literal (chunk P1.3).
+
+		The contract is the MariaDB adapter's (frappe.database.mariadb.database.escape): the
+		return value is a fully quoted literal the caller splices into a SQL fragment (legacy
+		permission-query-condition strings, frappe/model/db_query.py filters, note.py, ...).
+		The qb path stays fully bound - only these interpolated fragments need a literal.
+		SurrealQL literals are single-quoted; backslash, the quote and the common control
+		characters are escaped, and bytes are decoded first (MariaDB escape_string parity).
+		`percent` keeps the MariaDB signature: LIKE/pyformat callers get `%` doubled, and
+		SurrealDB's LIKE collapses adjacent % wildcards, so a doubled pattern matches the
+		same rows as the undoubled one.
+		"""
+		s = frappe.as_unicode(s)
+		s = (
+			s.replace("\\", "\\\\")
+			.replace("'", "\\'")
+			.replace("\n", "\\n")
+			.replace("\r", "\\r")
+			.replace("\t", "\\t")
+			.replace("\0", "\\0")
+			.replace("\b", "\\b")
+			.replace("\f", "\\f")
+		)
+		if percent:
+			s = s.replace("%", "%%")
+		return "'" + s + "'"
 
 	def mogrify(self, query: Query, values: QueryValues):
 		"""Log-display form of a statement. P1.3: the driver always executes with bound
