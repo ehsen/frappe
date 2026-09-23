@@ -39,7 +39,9 @@ class TextCollationShadow:
 	column: str  # e.g. "description"
 
 
-BUILTIN: frozenset[TextCollationShadow] = frozenset()
+BUILTIN: frozenset[TextCollationShadow] = frozenset({
+	TextCollationShadow("tabToDo", "description"),
+})
 
 _registered: set[TextCollationShadow] = set()
 _frozen: bool = False
