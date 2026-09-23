@@ -7,7 +7,8 @@ from decimal import Decimal
 from pypika import Order, Table
 from pypika import functions as fn
 from pypika.functions import Function
-from pypika.terms import ExistsCriterion as Exists, Tuple, ValueWrapper
+from pypika.terms import ExistsCriterion as Exists
+from pypika.terms import Tuple, ValueWrapper
 
 import frappe
 from frappe.database.schema import DbColumn
@@ -17,8 +18,8 @@ from frappe.database.surrealdb.errors import SurrealDBNotImplementedError, Surre
 from frappe.database.surrealdb.translator import render
 from frappe.query_builder import functions as qf
 from frappe.query_builder.surrealdb_builder import SurrealDB
-from frappe.tests import UnitTestCase
 from frappe.query_builder.terms import ParameterizedValueWrapper, SubQuery
+from frappe.tests import UnitTestCase
 
 T = Table("tabDoc")
 
@@ -984,3 +985,80 @@ class TestSurrealDBTranslator(UnitTestCase):
 		self.assertIn("$param1", sql)
 		self.assertIn("$param2", sql)
 		self.assertEqual(set(wrapper.get_parameters()), {"param1", "param2"})
+class TestFragmentParser(UnitTestCase):
+	"""Chunk P1.6d: RawCriterion / CombinedRawCriterion fragments parse into the ordinary
+	predicate machinery - the leaves render exactly like a typed query (bound values, collation
+	shadows, NULL guards), and unknown MariaDB syntax fails closed."""
+
+	def test_note_shape(self):
+		"""The permission-query-condition shape (`tabX`.col = 'v' or `tabX`.check = 1)."""
+		from frappe.database.query import RawCriterion
+
+		sql, params = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("(`tabDoc`.title = 'x' or `tabDoc`.flag = 1)")))
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE ((`title@ci` = $param1) OR (`flag` = $param2)) /*cols:name*/ /*kinds:varchar*/",
+		)
+		self.assertEqual(params.values, {"param1": C.ci_key("x"), "param2": 1})
+
+	def test_combined_raw_criterion(self):
+		from frappe.database.query import RawCriterion
+
+		sql, params = r(
+			SurrealDB.from_(T)
+			.select(T.name)
+			.where(RawCriterion("`tabDoc`.qty = 1") | RawCriterion("`tabDoc`.flag = 0"))
+		)
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE ((`qty` = $param1) OR (`flag` = $param2)) /*cols:name*/ /*kinds:varchar*/",
+		)
+		self.assertEqual(params.values, {"param1": 1, "param2": 0})
+
+	def test_in_and_not_in(self):
+		from frappe.database.query import RawCriterion
+
+		sql, _ = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("`tabDoc`.qty in (1, 2)")))
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE (`qty` IN [$param1, $param2]) /*cols:name*/ /*kinds:varchar*/",
+		)
+		sql, _ = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("`tabDoc`.qty not in (1, 2)")))
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE (`qty` != NULL AND `qty` != NONE AND NOT (`qty` IN [$param1, $param2])) /*cols:name*/ /*kinds:varchar*/",
+		)
+
+	def test_like_goes_through_the_like_shadow(self):
+		from frappe.database.query import RawCriterion
+
+		sql, params = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("`tabDoc`.name like 'a%'")))
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE (`name@like` != NULL AND `name@like` != NONE AND string::matches(`name@like`, $param1)) /*cols:name*/ /*kinds:varchar*/",
+		)
+		self.assertEqual(params.values, {"param1": C.like_regex("a%", "\\")})
+
+	def test_is_null_of_an_unshadowed_text(self):
+		from frappe.database.query import RawCriterion
+
+		sql, params = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("`tabDoc`.notes is null")))
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE (`notes` = NULL OR `notes` = NONE) /*cols:name*/ /*kinds:varchar*/",
+		)
+		self.assertEqual(params.values, {})
+
+	def test_unknown_function_fails_closed(self):
+		from frappe.database.query import RawCriterion
+
+		with self.assertRaises(SurrealDBProgrammingError) as cm:
+			r(SurrealDB.from_(T).select(T.name).where(RawCriterion("concat(title, name) = 'x'")))
+		self.assertEqual(cm.exception.args[0], 1054)
+
+	def test_unknown_table_fails_closed(self):
+		from frappe.database.query import RawCriterion
+
+		with self.assertRaises((SurrealDBNotImplementedError, SurrealDBProgrammingError)) as cm:
+			r(SurrealDB.from_(T).select(T.name).where(RawCriterion("`tabOther`.title = 'x'")))
+		self.assertIn("not in the FROM/JOIN list", str(cm.exception))

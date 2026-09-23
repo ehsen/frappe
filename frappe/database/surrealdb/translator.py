@@ -34,8 +34,22 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from types import SimpleNamespace
 from typing import ClassVar
 
-from pypika.queries import QueryBuilder
-from pypika.terms import AggregateFunction, Node
+from pypika.enums import Boolean, Equality, Matching
+from pypika.queries import Field, QueryBuilder, Table
+from pypika.terms import (
+	AggregateFunction,
+	BasicCriterion,
+	BetweenCriterion,
+	ComplexCriterion,
+	ContainsCriterion,
+	Node,
+	Not,
+	NotNullCriterion,
+	NullCriterion,
+	NullValue,
+	Tuple,
+	ValueWrapper,
+)
 
 import frappe
 from frappe.database.surrealdb import collation, text_shadows, values
@@ -73,6 +87,7 @@ EMPTY_STRING_AS = {
 }
 _NOTHING = object()
 P1_6C = "P1.6c"
+P1_6D = "P1.6d"
 
 
 AGGREGATE_NAMES = frozenset(
@@ -213,6 +228,230 @@ class _CommaJoin:
 		self.item = item
 		self.criterion = criterion
 		self.how = ""
+
+
+_FRAG_OP = {
+	"=": Equality.eq,
+	"!=": Equality.ne,
+	"<>": Equality.ne,
+	"<": Equality.lt,
+	">": Equality.gt,
+	"<=": Equality.lte,
+	">=": Equality.gte,
+}
+
+
+class _FragmentParser:
+	"""Recursive-descent parser for the raw SQL fragments Frappe embeds as `RawCriterion` /
+	`CombinedRawCriterion` (permission query conditions, `build_match_conditions`, ad-hoc
+	`.where(RawCriterion(...))`). Chunk P1.6d.
+
+	The fragment text is parsed into a PyPika criterion tree which the ordinary `predicate()` then
+	renders, so every leaf goes through the same BasicCriterion machinery as a typed query - the
+	same bound values, collation shadows, NULL guards and fail-closed rules. MariaDB syntax the
+	parser does not know (functions, sub-queries, arithmetic, EXISTS, %s placeholders) raises; a
+	fragment is never approximated."""
+
+	_TOKEN = re.compile(
+		r"""[ \t\r\n]+
+		|`(?P<backtick>[^`]+)`
+		|'(?P<sq>(?:[^'\\]|\\.|'')*)'
+		|"(?P<dquote>(?:[^"\\]|\\.)*)"
+		|(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
+		|(?P<word>[A-Za-z_@][A-Za-z0-9_$@]*)
+		|(?P<op><=|>=|!=|<>|=|<|>)
+		|(?P<paren>[(),.])
+		""",
+		re.VERBOSE,
+	)
+
+	def __init__(self, renderer, text: str):
+		self.r = renderer
+		self.toks = []
+		pos = 0
+		while pos < len(text):
+			m = self._TOKEN.match(text, pos)
+			if m is None:
+				unsupported(f"the SQL fragment character {text[pos]!r}", P1_6D)
+			pos = m.end()
+			kind = m.lastgroup
+			if kind is not None:  # whitespace has no named group
+				self.toks.append((kind, m.group(kind)))
+		self.i = 0
+
+	def _peek(self) -> tuple:
+		return self.toks[self.i] if self.i < len(self.toks) else (None, None)
+
+	def _punct(self, text: str) -> bool:
+		kind, token = self._peek()
+		if kind == "paren" and token == text:
+			self.i += 1
+			return True
+		return False
+
+	def _kw(self, *words: str) -> bool:
+		kind, token = self._peek()
+		if kind == "word" and token.lower() in words:
+			self.i += 1
+			return True
+		return False
+
+	def _name(self) -> str:
+		kind, token = self._peek()
+		if kind not in ("backtick", "word"):
+			unsupported("an identifier at the end of the SQL fragment", P1_6D)
+		self.i += 1
+		return token
+
+	def parse(self):
+		node = self._or()
+		if self.i != len(self.toks):
+			unsupported(f"a trailing {self.toks[self.i][1]!r} in the SQL fragment", P1_6D)
+		return node
+
+	def _or(self):
+		node = self._and()
+		while self._kw("or"):
+			node = ComplexCriterion(Boolean.or_, node, self._and())
+		return node
+
+	def _and(self):
+		node = self._not()
+		while self._kw("and"):
+			node = ComplexCriterion(Boolean.and_, node, self._not())
+		return node
+
+	def _not(self):
+		if self._kw("not"):
+			return Not(self._not())
+		return self._primary()
+
+	def _primary(self):
+		if self._punct("("):
+			node = self._or()
+			if not self._punct(")"):
+				unsupported("a missing ')' in the SQL fragment", P1_6D)
+			return node
+		return self._comparison()
+
+	def _comparison(self):
+		left = self._operand()
+		kind, token = self._peek()
+		if kind == "op":
+			self.i += 1
+			return BasicCriterion(_FRAG_OP[token], left, self._operand())
+		if kind == "word":
+			up = token.upper()
+			if up == "LIKE":
+				self.i += 1
+				return BasicCriterion(Matching.like, left, self._operand())
+			if up == "IS":
+				self.i += 1
+				negated = self._kw("not")
+				if not self._kw("null"):
+					unsupported("IS without NULL in the SQL fragment", P1_6D)
+				return NotNullCriterion(left) if negated else NullCriterion(left)
+			if up == "IN":
+				self.i += 1
+				return self._in(left)
+			if up == "BETWEEN":
+				self.i += 1
+				lo = self._operand()
+				if not self._kw("and"):
+					unsupported("BETWEEN without AND in the SQL fragment", P1_6D)
+				return BetweenCriterion(left, lo, self._operand())
+			if up == "NOT":
+				self.i += 1
+				_, token2 = self._peek()
+				up2 = (token2 or "").upper()
+				if up2 == "LIKE":
+					self.i += 1
+					return BasicCriterion(Matching.not_like, left, self._operand())
+				if up2 == "IN":
+					self.i += 1
+					return Not(self._in(left))
+				if up2 == "BETWEEN":
+					self.i += 1
+					lo = self._operand()
+					if not self._kw("and"):
+						unsupported("BETWEEN without AND in the SQL fragment", P1_6D)
+					return Not(BetweenCriterion(left, lo, self._operand()))
+				unsupported(f"NOT {token2!r} in the SQL fragment (only NOT LIKE / NOT IN / NOT BETWEEN)", P1_6D)
+		unsupported(f"a comparison with {token!r} in the SQL fragment", P1_6D)
+
+	def _in(self, left):
+		if not self._punct("("):
+			unsupported("IN without a parenthesised list in the SQL fragment", P1_6D)
+		items = []
+		while True:
+			items.append(self._operand())
+			if self._punct(","):
+				continue
+			if not self._punct(")"):
+				unsupported("a missing ')' of the IN list in the SQL fragment", P1_6D)
+			break
+		return ContainsCriterion(left, Tuple(*items))
+
+	def _operand(self):
+		kind, token = self._peek()
+		if kind in ("sq", "dquote"):
+			self.i += 1
+			return ValueWrapper(_sql_string(token, single=kind == "sq"))
+		if kind == "number":
+			self.i += 1
+			return ValueWrapper(int(token) if re.fullmatch(r"-?\d+", token) else Decimal(token))
+		if kind in ("backtick", "word"):
+			self.i += 1
+			first = token
+			_, token2 = self._peek()
+			if token2 == ".":
+				self.i += 1
+				second = self._name()
+				return self._fragment_field(first, second)
+			if kind == "word":
+				up = first.upper()
+				if up == "NULL":
+					return NullValue()
+				if up in ("TRUE", "FALSE"):
+					return ValueWrapper(up == "TRUE")
+			return self._fragment_field(None, first)
+		unsupported(f"an operand {token!r} in the SQL fragment", P1_6D)
+
+	def _fragment_field(self, table, name):
+		"""Resolve `table`.`name` (or a bare column) against the query's tables, mirroring `_owner`."""
+		if table is None:
+			matches = [c for c in self.r.ctxs if c.schema.column(name) is not None]
+			if not matches:
+				raise SurrealDBProgrammingError(1054, f"Unknown column '{name}' in 'field list'")
+			if len(matches) > 1:
+				raise SurrealDBProgrammingError(1052, f"Column '{name}' in field list is ambiguous")
+			return Field(name, table=matches[0].table)
+		matches = [c for c in self.r.ctxs if getattr(c.table, "_table_name", None) == table]
+		if not matches:
+			unsupported(f"a column of a table that is not in the FROM/JOIN list ('{table}')", P1_6D)
+		if len(matches) > 1:
+			unsupported(f"a column of the table '{table}' listed more than once (self-join)", P1_6D)
+		return Field(name, table=matches[0].table)
+
+
+def _sql_string(raw: str, single: bool) -> str:
+	"""The body of a quoted SQL string -> its value: `''` doubling plus backslash escapes."""
+	out = []
+	i = 0
+	while i < len(raw):
+		c = raw[i]
+		if c == "\\" and i + 1 < len(raw):
+			next_ = raw[i + 1]
+			out.append({"n": "\n", "t": "\t", "r": "\r", "0": "\0", "b": "\b", "Z": "\x1a"}.get(next_, next_))
+			i += 2
+			continue
+		if single and c == "'" and i + 1 < len(raw) and raw[i + 1] == "'":
+			out.append("'")
+			i += 2
+			continue
+		out.append(c)
+		i += 1
+	return "".join(out)
 
 
 class Renderer:
@@ -1078,6 +1317,8 @@ class Renderer:
 		if kind.endswith("ValueWrapper"):
 			truth = bool(term.value)
 			return "true" if truth != negate else "false"
+		if kind in ("RawCriterion", "CombinedRawCriterion"):
+			return self._raw_criterion(term, negate)
 		unsupported(f"the predicate {kind}", "P1.6")
 
 	def _basic(self, term, negate: bool) -> str:
@@ -1226,7 +1467,29 @@ class Renderer:
 			return f"({self._guard(stored)} AND ({stored} < {lo_p} OR {stored} > {hi_p}))"
 		return f"({self._guard(stored)} AND {stored} >= {lo_p} AND {stored} <= {hi_p})"
 
+	def _raw_criterion(self, term, negate: bool) -> str:
+		"""`RawCriterion` / `CombinedRawCriterion` (chunk P1.6d): parse the fragment text into a
+		PyPika criterion and render it through the ordinary predicate() machinery."""
+		if _kind(term) == "CombinedRawCriterion":
+			op = str(term.operator).strip().upper()
+			if op not in ("AND", "OR"):
+				unsupported(f"the boolean operator {op!r} of a CombinedRawCriterion", P1_6D)
+			joiner = ("or" if op == "AND" else "and") if negate else op.lower()
+			return (
+				f"({self._raw_side(term.left, negate)} {joiner.upper()} {self._raw_side(term.right, negate)})"
+			)
+		return self.predicate(_FragmentParser(self, term.sql_string).parse(), negate)
+
+	def _raw_side(self, term, negate: bool) -> str:
+		kind = _kind(term)
+		if kind == "RawCriterion":
+			return self.predicate(_FragmentParser(self, term.sql_string).parse(), negate)
+		if kind == "CombinedRawCriterion":
+			return self._raw_criterion(term, negate)
+		return self.predicate(term, negate)
+
 	# sub-queries -----------------------------------------------------------------------------------------------------
+
 	def _hoist(self, rows: str) -> str:
 		"""A `LET $sqN` statement that runs the (already rendered) uncorrelated sub-query once, before the statement."""
 		self.shared.counter += 1
