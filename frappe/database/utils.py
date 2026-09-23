@@ -197,6 +197,9 @@ def drop_index_if_exists(table: str, index: str):
 			# Postgres drops indexes with DROP INDEX, not ALTER TABLE ... DROP INDEX
 			safe_index = index.replace('"', '""')
 			frappe.db.sql_ddl(f'DROP INDEX IF EXISTS "{safe_index}"')
+		elif frappe.db.db_type == "surrealdb":
+			# SurrealDB: REMOVE INDEX ... ON table (same shape the driver's schema sync uses)
+			frappe.db.sql_ddl(f"REMOVE INDEX IF EXISTS `{index}` ON `{table}`")
 		else:
 			frappe.db.sql_ddl(f"ALTER TABLE `{table}` DROP INDEX `{index}`")
 	except Exception as e:

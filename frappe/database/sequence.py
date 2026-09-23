@@ -105,6 +105,9 @@ def _get_existing_sequences() -> set[str]:
 			"""SELECT sequence_name FROM information_schema.sequences
 			WHERE sequence_schema = 'public'"""
 		)
+	elif db.db_type == "surrealdb":
+		# SurrealDB sequences (DEFINE SEQUENCE) are listed by the driver via INFO FOR DB
+		return db._sequence_names()
 	else:
 		rows = db.sql(
 			"""SELECT TABLE_NAME FROM information_schema.TABLES

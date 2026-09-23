@@ -1,10 +1,9 @@
 import datetime
 import re
+from contextlib import contextmanager
 
 import frappe
-from contextlib import contextmanager
 from frappe.database.database import Database
-from frappe.database.utils import Query, QueryValues
 from frappe.database.surrealdb import collation, text_shadows
 from frappe.database.surrealdb.connection import (
 	DEFAULT_NAMESPACE,
@@ -51,6 +50,7 @@ from frappe.database.surrealdb.schema import (
 	table_schema_from_info,
 	unquote,
 )
+from frappe.database.utils import Query, QueryValues
 from frappe.utils import get_table_name
 
 
@@ -289,7 +289,10 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		for p in projections:
 			if not re.fullmatch(r"(?:`[\w@]+`|\w+)(?:\s+as\s+\w+)?", p, re.I):
 				return query  # complex projection: leave the statement untouched
-		projected = {re.sub(r"[`]", "", p.split()[-1 if re.search(r"(?i)\s+as\s", p) else 0]).lower() for p in projections}
+		projected = {
+			re.sub(r"[`]", "", p.split()[-1 if re.search(r"(?i)\s+as\s", p) else 0]).lower()
+			for p in projections
+		}
 		schema = None
 		table_m = re.search(r"(?is)from\s+(`[^`]+`|\"[^\"]+\"|[\w@]+)", head)
 		if table_m:
@@ -310,7 +313,9 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		proj_start, proj_end = proj_m.span(1)
 		new_projections = ", ".join([*projections, *(f"`{f}` AS `__o{i}`" for i, f in enumerate(hidden))])
 		query = f"{head[:proj_start]}{new_projections}{head[proj_end:]} ORDER BY {', '.join(rewritten)}{tail}"
-		names = [re.sub(r"[`]", "", p.split()[-1] if re.search(r"(?i)\s+as\s", p) else p) for p in projections]
+		names = [
+			re.sub(r"[`]", "", p.split()[-1] if re.search(r"(?i)\s+as\s", p) else p) for p in projections
+		]
 		if schema:
 			kinds = [schema.column(n).kind for n in names if schema.column(n) is not None]
 			if len(kinds) == len(names):
@@ -662,6 +667,12 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 	def truncate(self, doctype: str):
 		"""Remove every row. (MariaDB's TRUNCATE also commits implicitly and resets AUTO_INCREMENT.)"""
 		self.sql_ddl(f"DELETE {quote_table(get_table_name(doctype))}")
+
+	def explain_query(self, query, values=None):
+		"""SurrealDB has no EXPLAIN; MariaDB logs a plan here - log the statement text instead."""
+		frappe.log("--- query explain (surrealdb: no EXPLAIN, statement text only) ---")
+		frappe.log(str(query))
+		frappe.log("--- query explain end ---")
 
 	# --- system tables ---------------------------------------------------------------------------------------------
 	def _create_system_table(self, name: str):

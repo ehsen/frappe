@@ -1,7 +1,10 @@
 import re
 
+from pypika.terms import CustomFunction
+
 import frappe
 from frappe import _
+from frappe.query_builder.functions import Max
 from frappe.utils import cint, cstr, flt
 from frappe.utils.defaults import get_not_null_defaults
 
@@ -148,9 +151,11 @@ class DBTable:
 				current_length = current_length[0]
 				if cint(current_length) > cint(new_length):
 					try:
-						# check for truncation
-						max_length = frappe.db.sql(
-							f"""SELECT MAX(CHAR_LENGTH(`{col.fieldname}`)) FROM `tab{self.doctype}`"""
+						# check for truncation (qb so the SurrealDB translator maps CHAR_LENGTH)
+						_table = frappe.qb.DocType(self.doctype)
+						_char_length = CustomFunction("CHAR_LENGTH", ["x"])
+						max_length = (
+							frappe.qb.from_(_table).select(Max(_char_length(_table[col.fieldname]))).run()
 						)
 
 					except frappe.db.InternalError as e:
