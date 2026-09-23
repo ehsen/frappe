@@ -222,7 +222,19 @@ def build_table_count_cache():
 	):
 		return
 
-	if frappe.db.db_type != "sqlite":
+	if frappe.db.db_type == "surrealdb":
+		# Parity with MariaDB's `information_schema.tables` scan below (SurrealDB has no
+		# information_schema, and frappe.db.sql passes the SurrealDB dialect through verbatim):
+		# count records per table via the driver's table list (P1.4 INFO FOR DB) and the
+		# driver's native aggregate form (GROUP ALL answers one row over all records).
+		counts = {}
+		for table in frappe.db.get_tables():
+			rows = frappe.db.sql(f"SELECT count() AS c FROM `{table}` GROUP ALL /*cols:c*/")
+			if rows:
+				counts[table.replace("tab", "", 1)] = rows[0][0] or 0
+		frappe.cache.set_value("information_schema:counts", counts)
+		return counts
+	elif frappe.db.db_type != "sqlite":
 		table_name = frappe.qb.Field("table_name").as_("name")
 		table_rows = frappe.qb.Field("table_rows").as_("count")
 		information_schema = frappe.qb.Schema("information_schema")
