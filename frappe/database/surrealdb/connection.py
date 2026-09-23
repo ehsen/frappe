@@ -390,11 +390,21 @@ class SurrealConnection:
 			pass
 
 	def _require_open(self):
-		if self._client is None or self._lost:
-			raise SurrealDBConnectionError(
-				CR_SERVER_GONE,
-				"SurrealDB connection is not open (lost or closed); reconnect before running queries.",
-			)
+		if self._client is not None and not self._lost:
+			return
+		if self._client is not None and self._lost:
+			# mysqlclient `auto_reconnect=True` parity (frappe/database/mariadb/database.py): a session
+			# lost BETWEEN units of work (idle server-side close during a long non-DB stretch, lost
+			# socket) is transparently re-established on the next statement, like MariaDB. The lost
+			# session had no transaction (_mark_lost cleared it) and no unit state, so a fresh session
+			# cannot repeat or hide work. A connection that failed mid-statement keeps the existing
+			# in-flight semantics (the failing statement is not retried; the NEXT one lands here).
+			self._reopen()
+			return
+		raise SurrealDBConnectionError(
+			CR_SERVER_GONE,
+			"SurrealDB connection is not open (lost or closed); reconnect before running queries.",
+		)
 
 	def _mark_lost(self):
 		"""The session is gone: server-side transaction and unit state are dead."""

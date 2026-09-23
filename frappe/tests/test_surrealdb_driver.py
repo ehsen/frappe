@@ -296,10 +296,25 @@ class TestSurrealDBDriver(UnitTestCase):
 			db.sql("CREATE t:1 SET name = 'a'")
 		self.assertEqual(server.clients, 1)
 		self.assertEqual(len(queries(server)), 1, "the write was attempted exactly once")
-		with self.assertRaises(
-			E.SurrealDBConnectionError
-		):  # and the connection stays unusable until reconnected
-			db.sql("SELECT 1")
+		# auto_reconnect parity (mysqlclient, frappe/database/mariadb/database.py:111): the next
+		# statement re-establishes the session (the dead write is never re-retried - exactly one
+		# CREATE reached the wire), so no lost work is repeated or hidden.
+		db.sql("SELECT 1")
+		self.assertEqual(server.clients, 2, "the next statement reconnected exactly once")
+		self.assertEqual(
+			len([q for q in queries(server) if "CREATE" in q[1]]), 1, "no lost write was replayed"
+		)
+
+	def test_session_lost_between_units_is_reestablished_like_mariadb_auto_reconnect(self):
+		server = FakeServer(lambda q, p, t: ok([{"name": "a"}]))
+		db = make_db(server)
+		db._conn.commit()  # nothing in flight
+		db._conn._mark_lost()  # the server closed the idle session (2026-09-23 g1-full1 shard1 repro)
+		self.assertEqual(db.sql("SELECT name FROM t"), (("a",),))
+		self.assertEqual(server.clients, 2, "reconnected exactly once")
+		# and a write on the healed session runs normally
+		db.sql("CREATE t:x SET name = 'x'")
+		self.assertEqual(server.clients, 2)
 
 	def test_connection_loss_inside_a_transaction_is_not_retried(self):
 		server = FakeServer()
