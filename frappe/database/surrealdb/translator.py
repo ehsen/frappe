@@ -38,10 +38,11 @@ from pypika.queries import QueryBuilder
 from pypika.terms import AggregateFunction, Node
 
 import frappe
-from frappe.database.surrealdb import collation, values
+from frappe.database.surrealdb import collation, text_shadows, values
 from frappe.database.surrealdb.errors import SurrealDBProgrammingError, unsupported
 from frappe.database.surrealdb.schema import (
 	SHADOW_CI,
+	SHADOW_HASH,
 	SHADOW_LIKE,
 	SYSTEM_KEYS,
 	ColumnSpec,
@@ -143,12 +144,15 @@ def _scale_of(spec: ColumnSpec | None, const=_NOTHING) -> int:
 
 @dataclass
 class Expr:
-	"""A compiled value expression: SurrealQL text, its type, and (varchar only) the collation shadows of its value."""
+	"""A compiled value expression: SurrealQL text, its type, and (collation-shadow columns only) the
+	collation shadows of its value. `hash` carries the @hash witness reference of a plain shadowed-text
+	column, so a column-to-column copy can move it; computed strings have none (fail closed)."""
 
 	sql: str | None
 	spec: ColumnSpec | None
 	ci: str | None = None
 	like: str | None = None
+	hash: str | None = None
 	const: object = _NOTHING
 	opaque_string: bool = False  # `IFNULL(non_string, '')`: only comparable with '' (see `_ifnull`)
 
@@ -313,9 +317,11 @@ class Renderer:
 	def _col(self, ctx: TableCtx, spec: ColumnSpec) -> Expr:
 		stored = physical(spec.name)
 		expr = Expr(ctx.prefix + quote(stored), spec)
-		if spec.is_varchar:
+		if spec.has_collation_shadow:
 			expr.ci = ctx.prefix + quote(stored + SHADOW_CI)
 			expr.like = ctx.prefix + quote(stored + SHADOW_LIKE)
+			if spec.has_integrity_hash:
+				expr.hash = ctx.prefix + quote(stored + SHADOW_HASH)
 		return expr
 
 	def _tkey(self, term):
@@ -1789,12 +1795,17 @@ class Renderer:
 			) from e
 
 	def _stored_fields(self, spec: ColumnSpec, encoded) -> dict:
-		"""The stored fields a column value produces: the column itself and, for varchar, its two shadows."""
+		"""The stored fields a column value produces: the column itself and, for a collation-shadow column
+		(varchar or allow-listed text), its shadows; a shadowed text column also carries the @hash witness
+		(P1.15). A NULL value produces all-NONE shadows - writing them removes the fields (P0.8)."""
 		name = physical(spec.name)
 		out = {name: encoded}
-		if spec.is_varchar:
-			out[name + SHADOW_CI] = None if encoded is None else collation.ci_key(encoded)
-			out[name + SHADOW_LIKE] = None if encoded is None else collation.like_shadow(encoded)
+		if spec.has_collation_shadow:
+			shadows = text_shadows.build_collation_shadows(spec, encoded)
+			out[name + SHADOW_CI] = shadows["ci"]
+			out[name + SHADOW_LIKE] = shadows["like"]
+			if spec.has_integrity_hash:
+				out[name + SHADOW_HASH] = shadows["hash"]
 		return out
 
 	def _record_key(self, schema: TableSchema, value) -> str:
@@ -1869,14 +1880,22 @@ class Renderer:
 					unsupported("VALUES() of a column of another type", "P1.6")
 				stored = [physical(spec.name)] + (
 					[physical(spec.name) + SHADOW_CI, physical(spec.name) + SHADOW_LIKE]
-					if spec.is_varchar
+					+ ([physical(spec.name) + SHADOW_HASH] if spec.has_integrity_hash else [])
+					if spec.has_collation_shadow
 					else []
 				)
 				src = [physical(source.name)] + (
 					[physical(source.name) + SHADOW_CI, physical(source.name) + SHADOW_LIKE]
-					if source.is_varchar
+					+ ([physical(source.name) + SHADOW_HASH] if source.has_integrity_hash else [])
+					if source.has_collation_shadow
 					else []
 				)
+				if (spec.has_integrity_hash or source.has_integrity_hash) and len(stored) != len(src):
+					# P1.15 fail-closed: a hashed target needs a source that carries its own witness.
+					unsupported(
+						"VALUES() of a column with different shadowing (the @hash witness cannot be copied)",
+						"P1.6",
+					)
 				out += [f"{quote(a)} = $input.{quote(b)}" for a, b in zip(stored, src, strict=True)]
 				continue
 			is_literal, value = self._literal(term)
@@ -1904,16 +1923,26 @@ class Renderer:
 			else:  # MariaDB rounds half away from zero when a decimal is stored in an integer column
 				sql = f"IF {_absent(e.sql)} THEN NULL ELSE <int>{self._round_sql(e.sql, 0)} END"
 			return [f"{ref} = {sql}"]
-		if spec.is_varchar:
-			if e.kind != "varchar" or e.ci is None or e.like is None or e.opaque_string:
+		if spec.has_collation_shadow:
+			if self._family(e) != "str" or e.ci is None or e.like is None or e.opaque_string:
 				unsupported(
 					"storing a computed string (its collation shadows cannot be computed in SurrealQL)", P1_6C
 				)
-			return [
+			out = [
 				f"{ref} = {e.sql}",
 				f"{quote(name + SHADOW_CI)} = {e.ci}",
 				f"{quote(name + SHADOW_LIKE)} = {e.like}",
 			]
+			if spec.has_integrity_hash:
+				# P1.15 fail-closed: the @hash witness of a computed string cannot be produced here; only
+				# a plain column of another shadowed text column carries a copyable witness.
+				if e.hash is None:
+					unsupported(
+						"storing a computed string in a hashed text column (its @hash witness cannot be copied)",
+						P1_6C,
+					)
+				out.append(f"{quote(name + SHADOW_HASH)} = {e.hash}")
+			return out
 		if spec.kind in TEMPORAL_KINDS and e.kind == spec.kind:
 			return [f"{ref} = {e.sql}"]
 		unsupported(f"storing a {e.kind} expression in a {spec.logical} column", P1_6C)

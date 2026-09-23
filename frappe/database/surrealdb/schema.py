@@ -47,6 +47,7 @@ _MYSQL_ESCAPES = {
 
 SHADOW_CI = "@ci"
 SHADOW_LIKE = "@like"
+SHADOW_HASH = text_shadows.SHADOW_HASH  # "@hash": the engine-enforced integrity witness of a text shadow (P1.15)
 
 # Columns every DocType table has, in MariaDB's `create()` order: (name, logical type, nullable, default)
 DEFAULT_COLUMNS = (
@@ -104,7 +105,7 @@ def logical_name(stored: str) -> str:
 
 
 def is_shadow(stored: str) -> bool:
-	return stored.endswith((SHADOW_CI, SHADOW_LIKE))
+	return stored.endswith((SHADOW_CI, SHADOW_LIKE, SHADOW_HASH))
 
 
 def surql_string(value: str) -> str:
@@ -249,6 +250,8 @@ class ColumnSpec:
 		return surql_string(cstr(d))
 
 	def assertion(self) -> str | None:
+		# P1.15: varchar length caps stay varchar-only - a text_collation_shadow column keeps the
+		# unbounded Text semantics (text_collation_shadow must not imply length limits).
 		if self.custom_assert:
 			return f"$value = NULL OR ({self.custom_assert})" if self.nullable else self.custom_assert
 		v = "$value"
@@ -293,8 +296,14 @@ class ColumnSpec:
 		parts += ["COMMENT", surql_string(json.dumps(self.meta(), separators=(",", ":"), ensure_ascii=False))]
 		return " ".join(parts)
 
-	def define_shadows(self, table: str, overwrite: bool = False) -> list[str]:
-		if not self.is_varchar:
+	def define_shadows(self, table: str, overwrite: bool = False, hash_assertion: bool = True) -> list[str]:
+		"""Shadow-field DDL for one column: `@ci`/`@like` for every collation-shadow column (varchar or
+		allow-listed text), plus `@hash` for a text collation shadow. The @hash ASSERT is the P0.5-validated
+		form (`$this.<stored>`; `$after` is unusable inside a field ASSERT - measured). The sync hook defines
+		the fields WITHOUT the ASSERT first and re-defines them WITH it only after backfill verification
+		(P0.7 ordering); create/alter/redefine paths keep the ASSERT (safe: no existing row carries a
+		conflicting hash, and writes always produce source+shadows together)."""
+		if not self.has_collation_shadow:
 			return []
 		out = []
 		for suffix, kind in ((SHADOW_CI, "ci"), (SHADOW_LIKE, "like")):
@@ -303,10 +312,34 @@ class ColumnSpec:
 				f"DEFINE FIELD {'OVERWRITE ' if overwrite else ''}{quote(physical(self.name) + suffix)} "
 				f"ON {quote_table(table)} TYPE string | null DEFAULT NULL COMMENT {meta}"
 			)
+		if self.has_integrity_hash:
+			stored = physical(self.name)
+			if stored != self.name:
+				raise SurrealDBProgrammingError(
+					0, f"the @hash witness is not supported for the reserved-name column {self.name!r}"
+				)
+			meta = surql_string(json.dumps({"s": "hash", "of": self.name}, separators=(",", ":")))
+			parts = [
+				f"DEFINE FIELD {'OVERWRITE ' if overwrite else ''}{quote(stored + SHADOW_HASH)}",
+				f"ON {quote_table(table)} TYPE string | null DEFAULT NULL",
+			]
+			if hash_assertion:
+				# IF-form (P0.5/P0.7): NULL/NONE witnesses are legal mid-flight (the NULL-clearing write
+				# sets source and shadows together); a bypass of a NULL-hash row is caught by the
+				# sync hook's guarded event, which also rejects CREATE-without-hash.
+				parts.append(
+					f"ASSERT IF $value = NONE OR $value = NULL THEN true "
+					f"ELSE $value = crypto::sha256($this.{stored}) END"
+				)
+			parts.append(f"COMMENT {meta}")
+			out.append(" ".join(parts))
 		return out
 
 	def index_field(self) -> str:
-		"""Stored field an index on this column is defined on (the collation shadow for varchar)."""
+		"""Stored field an index on this column is defined on (the collation shadow for varchar).
+
+		P1.15: stays varchar-only by design - a shadowed text column is never index-eligible
+		(`shadow_index_eligible` is `is_varchar`; flipping this would index unbounded long text)."""
 		return physical(self.name) + SHADOW_CI if self.is_varchar else physical(self.name)
 
 
@@ -585,13 +618,11 @@ def backfill_default(table: str, spec: ColumnSpec, only_null: bool = False, db=N
 	column becomes NOT NULL). Rows that lack the field, or hold NULL, get the encoded default."""
 	stored = quote(physical(spec.name))
 	sets = [f"{stored} = {spec.default_literal()}"]
-	if spec.is_varchar:
-		sets.append(
-			f"{quote(physical(spec.name) + SHADOW_CI)} = {surql_string(collation.ci_key(cstr(spec.default)))}"
-		)
-		sets.append(
-			f"{quote(physical(spec.name) + SHADOW_LIKE)} = {surql_string(collation.like_shadow(cstr(spec.default)))}"
-		)
+	if spec.has_collation_shadow:
+		# P1.15: defaults of a shadowed text column carry the @hash witness as well.
+		for suffix, value in text_shadows.build_collation_shadows(spec, cstr(spec.default)).items():
+			name = physical(spec.name) + {"ci": SHADOW_CI, "like": SHADOW_LIKE, "hash": SHADOW_HASH}[suffix]
+			sets.append(f"{quote(name)} = {surql_string(value)}")
 	cond = f"{stored} = NONE OR {stored} = NULL"
 	(db or frappe.db).sql_ddl(f"UPDATE {quote_table(table)} SET {', '.join(sets)} WHERE {cond}")
 
@@ -625,17 +656,29 @@ def convert_column(
 					).format(table),
 					title=_("Incompatible Values"),
 				)
+	if not spec.has_integrity_hash:
+		# P1.15 §3.4: the column stops carrying an integrity hash (e.g. shadowed text -> varchar).
+		# The @hash field and its ASSERT must go FIRST: a later write of the source without a hash
+		# would otherwise be rejected by the stale ASSERT (or left stale under the event).
+		hash_stored = physical(spec.name) + SHADOW_HASH
+		info_fields = db._info(f"INFO FOR TABLE {quote_table(table)}").get("fields") or {}
+		if f"`{hash_stored}`" in info_fields or hash_stored in info_fields:
+			db.sql_ddl(f"REMOVE FIELD {quote(hash_stored)} ON {quote_table(table)}")
+			db.sql_ddl(f"UPDATE {quote_table(table)} UNSET {quote(hash_stored)}")
 	for stmt in redefine:
 		db.sql_ddl(stmt)
 	for rid, new in converted:
 		sets = [f"{quote(physical(spec.name))} = $v"]
 		params = {"tb": table, "rid": rid, "v": new}
-		if spec.is_varchar and new is not None:
+		if spec.has_collation_shadow and new is not None:
 			sets += [
 				f"{quote(physical(spec.name) + SHADOW_CI)} = $ci",
 				f"{quote(physical(spec.name) + SHADOW_LIKE)} = $lk",
 			]
 			params |= {"ci": collation.ci_key(new), "lk": collation.like_shadow(new)}
+			if spec.has_integrity_hash:
+				sets.append(f"{quote(physical(spec.name) + SHADOW_HASH)} = $hash")
+				params["hash"] = text_shadows.source_hash(new)
 		db.sql(f"UPDATE type::record($tb, $rid) SET {', '.join(sets)}", params)
 
 
@@ -878,7 +921,14 @@ def table_schema_from_info(table_name: str, info: dict) -> TableSchema:
 	ordered = sorted(parsed.columns.items(), key=lambda kv: (kv[1].get("o", 10**6), kv[0]))
 	columns = {}
 	for order, (name, meta) in enumerate(ordered):
-		columns[name] = ColumnSpec(name, meta["t"], nullable=bool(meta["n"]), order=order)
+		spec = ColumnSpec(name, meta["t"], nullable=bool(meta["n"]), order=order)
+		if spec.is_text and text_shadows.is_shadowed(table_name, name):
+			# P1.15: the allow-list marks the column so every string-collation operation uses the
+			# stored shadows. Readiness gating (the version marker / missing fields) is added by the
+			# sync hook's readiness state - until then the shadow fields exist whenever this column
+			# was created/migrated by this driver, and writes maintain them.
+			spec.text_collation_shadow = True
+		columns[name] = spec
 	return TableSchema(table_name, columns, parsed.indexes)
 
 

@@ -86,3 +86,29 @@ class TestSurrealDBTextShadows(UnitTestCase):
 		self.assertNotIn("hash", v)
 		self.assertEqual(v["ci"], C.ci_key("x"))
 		self.assertEqual(v["like"], C.like_shadow("x"))
+
+	def test_create_statements_shadow_ddl(self):
+		marked = S.ColumnSpec("text_sh", "longtext")
+		marked.text_collation_shadow = True
+		stmts = S.create_statements("tabKid", [marked])
+		text = "\n".join(stmts)
+		self.assertIn("DEFINE FIELD `text_sh@ci` ON `tabKid`", text)
+		self.assertIn("DEFINE FIELD `text_sh@like` ON `tabKid`", text)
+		self.assertIn("DEFINE FIELD `text_sh@hash` ON `tabKid`", text)
+		self.assertIn(
+			"ASSERT IF $value = NONE OR $value = NULL THEN true ELSE $value = crypto::sha256($this.text_sh) END",
+			text,
+		)
+		self.assertNotIn("DEFINE INDEX `text_sh`", text)  # never index-eligible
+		source_stmt = next(s for s in stmts if "DEFINE FIELD `text_sh` ON" in s)
+		self.assertNotIn("ASSERT", source_stmt)  # no varchar length cap on a text column
+		self.assertNotIn("`text_sh@ci`", source_stmt)
+		unmarked = "\n".join(S.create_statements("tabKid", [S.ColumnSpec("text", "longtext")]))
+		self.assertNotIn("`text@ci`", unmarked)
+		self.assertNotIn("`text@hash`", unmarked)
+		# the sync hook defines the fields first and re-DEFINES them with the ASSERT after verification
+		no_assert = marked.define_shadows("tabKid", hash_assertion=False)
+		self.assertEqual(len(no_assert), 3)
+		self.assertNotIn("ASSERT", "\n".join(no_assert))
+		overwrite = marked.define_shadows("tabKid", overwrite=True)
+		self.assertTrue(all("DEFINE FIELD OVERWRITE" in s for s in overwrite))

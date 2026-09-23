@@ -5,7 +5,7 @@ import frappe
 from contextlib import contextmanager
 from frappe.database.database import Database
 from frappe.database.utils import Query, QueryValues
-from frappe.database.surrealdb import collation
+from frappe.database.surrealdb import collation, text_shadows
 from frappe.database.surrealdb.connection import (
 	DEFAULT_NAMESPACE,
 	ConnectionParams,
@@ -33,6 +33,7 @@ from frappe.database.surrealdb.errors import (
 )
 from frappe.database.surrealdb.schema import (
 	SHADOW_CI,
+	SHADOW_HASH,
 	SHADOW_LIKE,
 	ColumnSpec,
 	SurrealDBTable,
@@ -591,16 +592,25 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		if meta is None:
 			raise SurrealDBProgrammingError(ER_CANT_DROP_FIELD_OR_KEY, f"Unknown column '{old_column_name}'")
 		spec = ColumnSpec(new_column_name, meta["t"], nullable=bool(meta["n"]))
+		# P1.15: the shadows belong to the stored column. When the OLD column carried them (varchar, or a
+		# registry-listed text column), the renamed column gets the shadow fields re-defined under the new
+		# name and the values copied - including @hash, whose ASSERT is re-defined for the new source name.
+		# The registry entry for the old name is stale afterwards (the sync hook cleans the event up);
+		# per §3.4 the copied shadows stay in place as documented dead storage until then.
+		if spec.is_text and text_shadows.is_shadowed(table, old_column_name):
+			spec.text_collation_shadow = True
 		self.sql_ddl(spec.define_field(table))
 		for stmt in spec.define_shadows(table):
 			self.sql_ddl(stmt)
 		old_s, new_s = physical(old_column_name), physical(new_column_name)
 		sets = [f"{quote(new_s)} = {quote(old_s)}"]
-		if spec.is_varchar:
+		if spec.has_collation_shadow:
 			sets += [
 				f"{quote(new_s + SHADOW_CI)} = {quote(old_s + SHADOW_CI)}",
 				f"{quote(new_s + SHADOW_LIKE)} = {quote(old_s + SHADOW_LIKE)}",
 			]
+		if spec.has_integrity_hash:
+			sets.append(f"{quote(new_s + SHADOW_HASH)} = {quote(old_s + SHADOW_HASH)}")
 		self.sql_ddl(f"UPDATE {quote_table(table)} SET {', '.join(sets)}")
 		for name, ix in info.indexes.items():
 			if any(base_field(f) == old_column_name for f in ix["fields"]):
@@ -613,10 +623,10 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 				]
 				new_name = new_column_name if name == old_column_name else name
 				self.sql_ddl(index_statement(table, new_name, fields, unique=ix["unique"]))
-		self._remove_column_definitions(table, old_s, spec.is_varchar)
+		self._remove_column_definitions(table, old_s, spec.has_collation_shadow, spec.has_integrity_hash)
 
 	def drop_columns(self, doctype: str, columns: list[str]) -> list | tuple:
-		"""Drop columns (and their shadow columns) from a table. Mirrors MariaDB's
+		"""Drop columns (and their shadow columns / integrity-hash witness) from a table. Mirrors MariaDB's
 		ALTER TABLE ... DROP COLUMN, including its implicit commit."""
 		table = get_table_name(doctype)
 		info = self.table_info(table)
@@ -627,15 +637,24 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 					ER_CANT_DROP_FIELD_OR_KEY, f"Can't DROP '{column}'; check that column/key exists"
 				)
 			spec = ColumnSpec(column, meta["t"], nullable=bool(meta["n"]))
-			self._remove_column_definitions(table, physical(column), spec.is_varchar)
+			if spec.is_text and text_shadows.is_shadowed(table, column):
+				spec.text_collation_shadow = True
+			self._remove_column_definitions(
+				table, physical(column), spec.has_collation_shadow, spec.has_integrity_hash
+			)
 		self.commit()
 		return ()
 
-	def _remove_column_definitions(self, table: str, stored: str, shadowed: bool):
-		"""Drop a column. `REMOVE FIELD` leaves the stored values behind (and a SCHEMAFULL table then rejects them on the
-		next copy/update), so they are unset too - after the definition is gone, because a still-defined `string | null`
-		field refuses the NONE that UNSET produces."""
-		names = [stored, *([stored + SHADOW_CI, stored + SHADOW_LIKE] if shadowed else [])]
+	def _remove_column_definitions(self, table: str, stored: str, shadowed: bool, hashed: bool = False):
+		"""Drop a column (and, when present, its `@ci`/`@like` shadows and `@hash` witness). `REMOVE FIELD`
+		leaves the stored values behind (and a SCHEMAFULL table then rejects them on the next copy/update),
+		so they are unset too - after the definition is gone, because a still-defined `string | null` field
+		refuses the NONE that UNSET produces."""
+		names = [stored]
+		if shadowed:
+			names += [stored + SHADOW_CI, stored + SHADOW_LIKE]
+		if hashed:
+			names.append(stored + SHADOW_HASH)
 		for n in names:
 			self.sql_ddl(f"REMOVE FIELD {quote(n)} ON {quote_table(table)}")
 		self.sql_ddl(f"UPDATE {quote_table(table)} UNSET {', '.join(quote(n) for n in names)}")
