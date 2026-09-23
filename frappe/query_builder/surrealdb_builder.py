@@ -60,6 +60,8 @@ class SurrealDBQueryBuilder(QueryBuilder):
 
 
 class SurrealDB(Base, Query):
+	Field = Field  # frappe.qb.Field(...) is used on the dialect class (cache_manager, commands/site.py)
+
 	_BuilderClasss = SurrealDBQueryBuilder
 
 	@classmethod
