@@ -158,6 +158,17 @@ class SiteMigration:
 		* Sync Installed Applications Version History
 		* Execute `after_migrate` hooks
 		"""
+		if frappe.db.db_type == "surrealdb":
+			# P1.15 (phase 7): text-collation shadows are registry-driven and must activate
+			# before any post-schema writes (sync_jobs inserts Comment feed docs). The model
+			# sync hash-skips unchanged DocType files, so a newly allow-listed column reaches
+			# SurrealDBTable.sync only when its own JSON changes - measured on p20_sdb: the
+			# tabComment entry activated nothing and every Comment INSERT failed with 1054.
+			print("Syncing text-collation shadows...")
+			from frappe.database.surrealdb import shadow_migration
+
+			shadow_migration.sync_all_table_shadows()
+
 		print("Syncing jobs...")
 		sync_jobs()
 

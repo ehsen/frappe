@@ -6,6 +6,13 @@ Ordering per column (P0.7): DEFINE the shadow fields WITHOUT the hash ASSERT -> 
 `csv` version marker on the source field's COMMENT -> DEFINE the guarded enforcement event. All steps
 complete for a table before the sync moves on (inside model sync, before post-sync patches).
 
+Two entry points drive the sync. `SurrealDBTable.sync()` covers the model-sync path (fresh table
+creation and DocType-JSON changes). `sync_all_table_shadows()` is the migrate-time hook (wired at the
+top of `Migrate.post_schema_updates`): the model sync hash-skips unchanged DocType files, so a newly
+allow-listed column would otherwise reach migrate with NO shadows while queries already mark it
+(measured on p20_sdb: the tabComment BUILTIN entry activated nothing and every Comment INSERT failed
+with 1054 "Unknown column 'content@ci'").
+
 The backfill selects rows that are *still invalid* (no OFFSET), so it is restartable and idempotent, and
 it carries a mandatory no-progress guard: a row that cannot be made valid would otherwise loop forever.
 Backfill runs offline (inside `bench migrate`); online backfill is unsupported (see OPEN-ITEMS §C)."""
@@ -213,6 +220,29 @@ def sync_table_shadows(table: str, specs: list, db=None) -> None:
 			sync_column_shadows(table, spec, db)
 
 
+def sync_all_table_shadows(db=None) -> list[str]:
+	"""Migrate-time, registry-driven sync of EVERY allow-listed column, independent of DocType-JSON
+	changes (the model sync hash-skips unchanged files - see the module docstring). Wired at the top
+	of `Migrate.post_schema_updates`, before sync_jobs. Tables absent on the site are skipped, so a
+	fresh test site or a partial install never blocks; returns the synced "table: columns" entries."""
+	db = db or frappe.db
+	by_table: dict[str, list[str]] = {}
+	for shadow in sorted(TS.all_shadowed(), key=lambda s: (s.table, s.column)):
+		by_table.setdefault(shadow.table, []).append(shadow.column)
+	synced = []
+	for table in sorted(by_table):
+		try:
+			schema = table_schema(table, db=db)
+		except SurrealDBProgrammingError:
+			continue  # table not present on this site
+		specs = [schema.column(column) for column in by_table[table]]
+		specs = [spec for spec in specs if spec is not None and spec.has_integrity_hash]
+		if specs:
+			sync_table_shadows(table, specs, db)
+			synced.append(f"{table}: {', '.join(spec.name for spec in specs)}")
+	return synced
+
+
 def _python_side_mismatches(table: str, spec, db) -> int:
 	"""Rows whose @ci/@like differ from the Python-computed keys of the stored value (invisible to the
 	in-engine predicate). Keyset-paged over record ids."""
@@ -248,7 +278,7 @@ def health() -> dict:
 	non-zero means raw writes bypassed the driver; re-run `bench migrate` to repair (offline)."""
 	out = {}
 	db = frappe.db
-	for shadow in sorted(TS.all_shadowed()):
+	for shadow in sorted(TS.all_shadowed(), key=lambda s: (s.table, s.column)):
 		key = f"{shadow.table}.{shadow.column}"
 		try:
 			schema = table_schema(shadow.table, db=db)

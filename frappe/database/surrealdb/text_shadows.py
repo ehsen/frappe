@@ -41,6 +41,7 @@ class TextCollationShadow:
 
 BUILTIN: frozenset[TextCollationShadow] = frozenset({
 	TextCollationShadow("tabToDo", "description"),
+	TextCollationShadow("tabComment", "content"),
 })
 
 _registered: set[TextCollationShadow] = set()

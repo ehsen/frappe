@@ -41,12 +41,12 @@ class TestSurrealDBTextShadows(UnitTestCase):
 		self.assertTrue(TS.is_shadowed("tabParityKid", "text_sh"))
 		self.assertFalse(TS.is_shadowed("tabParityKid", "text"))
 		self.assertFalse(TS.is_shadowed("tabOther", "text_sh"))
-		self.assertEqual(TS.all_shadowed(), frozenset({TS.TextCollationShadow("tabParityKid", "text_sh")}))
+		self.assertEqual(TS.all_shadowed(), TS.BUILTIN | frozenset({TS.TextCollationShadow("tabParityKid", "text_sh")}))
 
 	def test_freeze_is_idempotent_and_builtin_needs_no_registration(self):
 		TS.freeze()
 		TS.freeze()
-		self.assertEqual(TS.all_shadowed(), TS.BUILTIN)  # BUILTIN is empty until Phase 6 activates entries
+		self.assertEqual(TS.all_shadowed(), TS.BUILTIN)  # BUILTIN entries are members without registration (the P1.15 allow-list activations)
 
 	def test_columnspec_capability_gates(self):
 		with self.assertRaises(SurrealDBProgrammingError):

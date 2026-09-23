@@ -390,4 +390,20 @@ class TestSurrealDBTextShadowMigrationLive(LiveSurrealDB, UnitTestCase):
 			run(self.db, SurrealDB.from_(T).select(T.name).where(T.text_sh == "x"))
 		_sync()  # migrate re-establishes readiness
 		S.clear_schema_cache()
+	def test_migrate_time_sync_all_shadows(self):
+		"""The migrate-time, registry-driven hook: defines + backfills + marks + guards a column
+		whose shadows the model sync never defined (it hash-skips unchanged DocType files -
+		measured on p20_sdb/tabComment, where the BUILTIN entry activated nothing and Comment
+		INSERTs failed with 1054). BUILTIN tables absent on the site are skipped silently."""
+		self.assertNotIn("`text_sh@hash`", (self.db._info(f"INFO FOR TABLE `{TABLE}`").get("fields") or {}))
+		synced = MIG.sync_all_table_shadows(db=self.db)
+		self.assertEqual(synced, [f"{TABLE}: text_sh"])  # BUILTIN tables (tabToDo/tabComment) absent here
+		self.assertEqual(MIG.count_invalid_shadows(TABLE, kid_spec(self.db), self.db), 0)
+		fields = (self.db._info(f"INFO FOR TABLE `{TABLE}`").get("fields") or {})
+		self.assertEqual(S.parse_field_meta(fields["text_sh"]).get("csv"), TS.COLLATION_SHADOW_VERSION)
+		self.assertIn("ASSERT", fields["`text_sh@hash`"])
+		_, ci, lk, h = kid_shadow_row(self.db, TABLE, "M1")
+		self.assertEqual((ci, lk, h), (C.ci_key("Äpple"), C.like_shadow("Äpple"), TS.source_hash("Äpple")))
+		_, ci, lk, h = kid_shadow_row(self.db, TABLE, "M3")
+		self.assertEqual((ci, lk, h), (None, None, None))  # NULL source carries NULL shadows (P0.8)
 		self.assertTrue(S.table_schema(TABLE, db=self.db).column("text_sh").shadow_ready)
