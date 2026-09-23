@@ -27,6 +27,7 @@ upstream project.
 | P1.3 driver boundary (connection, cursor, error mapping, transactions, parameters) | implemented and tested (fake SDK and live server) |
 | P1.4 schema: fieldtype mapping, DDL, introspection, collation shadow keys, sequences | implemented; all 271 table-backed Frappe DocTypes apply to SurrealDB and match MariaDB's columns and indexes with no unexplained difference |
 | P1.6 query translator: SELECT/INSERT/UPDATE/DELETE with exact NULL and collation semantics, aggregates, GROUP BY (incl. non-strict), expressions and functions, INNER/LEFT joins, uncorrelated sub-queries, upserts | implemented and compared with MariaDB on identical data (20 live parity tests, 24 golden tests); long-text comparisons, correlated sub-queries, right/full joins and unmapped functions fail closed |
+| P1.15 allow-listed text-column collation shadows (`tabToDo.description`, `tabComment.content`) | implemented; =, !=, IN/NOT IN, emptiness, LIKE, ORDER BY, GROUP BY on those columns match MariaDB `utf8mb4_unicode_ci` exactly — stored `@ci`/`@like` keys + engine-enforced `@hash`, migrate-time sync/backfill; extend via `text_shadows.BUILTIN` + `bench migrate`; unlisted text columns keep the pre-P1.15 behavior byte-identical |
 | ORM layer, locks and savepoints, raw-SQL rewrites, site install | not started |
 
 A site cannot be installed on SurrealDB yet (the framework bootstrap is still missing). Everything not implemented **fails closed**: it raises
@@ -40,7 +41,9 @@ All SurrealDB code is isolated so that merging upstream stays cheap:
 ```
 frappe/database/surrealdb/      the backend: database.py, connection.py (driver boundary), errors.py, setup_db.py (provisioning),
                                 schema.py (fieldtypes -> DDL, introspection), collation.py (utf8mb4_unicode_ci shadow keys),
-                                values.py (value encoders), translator.py (PyPika -> SurrealQL), data/ (frozen weight table)
+                                text_shadows.py (text-collation shadow registry + shadow primitive), shadow_migration.py
+                                (migrate-time sync/backfill/integrity/readiness), values.py (value encoders),
+                                translator.py (PyPika -> SurrealQL), data/ (frozen weight table)
 frappe/query_builder/surrealdb_builder.py   query builder facade over the translator
 frappe/tests/test_surrealdb_*.py            tests (dispatch, error classification, driver, live server)
 ```
@@ -63,6 +66,61 @@ Branches: `version-16` mirrors upstream, `surreal/v16` is the integration branch
   transaction leaves its write behind in SurrealDB 3.2.4, so the driver refuses to commit such a transaction.
 * **Values are always bound as parameters**, never interpolated. Date/time values are encoded by the (future) query
   translator, which knows the column type.
+
+## Text collation shadows (P1.15)
+
+MariaDB string collation cannot be computed inside SurrealQL (the exact `utf8mb4_unicode_ci` key exists only
+in Python), so **allow-listed text-kind columns store their collation keys at write time** and queries read
+them — exactly like varchar columns. Allow-listed today (option B, mechanism (a)):
+`tabToDo.description`, `tabComment.content`. Unlisted text columns keep the pre-P1.15 behavior byte-identical
+(inline case-fold for =/IN/emptiness; LIKE/ORDER BY/GROUP BY fail closed).
+
+Invariant (verbatim from the P1.15 plan):
+
+```
+A text_collation_shadow column remains physically and semantically a Text
+column EXCEPT for string-collation operations.
+
+Its @ci and @like fields provide the MariaDB-compatible equivalence relation
+used by =, !=, IN, NOT IN, emptiness, LIKE, ORDER BY and GROUP BY. All of these
+operations MUST use the same collation representation. Mixing @ci with inline
+string::lowercase() on one column is forbidden.
+
+text_collation_shadow MUST NOT imply: varchar length limits (schema.assertion
+stays is_varchar-only), varchar DDL type / meta["t"] (kind is never mutated),
+index eligibility (index_field stays is_varchar-only).
+
+Source, @ci, @like and @hash are written together, by build_collation_shadows(),
+in one statement. The engine rejects any write where @hash != sha256(source).
+If shadow integrity is not established for a column, queries on it RAISE.
+They never fall back to the inline lowercase path.
+```
+
+* **Registry** (`text_shadows.py`): `BUILTIN` + `register()`, legal only before `freeze()` (frozen at
+  driver connect, before any schema sync or query). `ColumnSpec.text_collation_shadow` is set from the
+  registry; collation questions go through `has_collation_shadow`, while length caps, the DDL type and
+  index eligibility stay varchar-only.
+* **Write path**: every write calls `build_collation_shadows(spec, value)` after value coercion and stores
+  the source plus `@ci` (collation key), `@like` (LIKE shadow) and `@hash` (sha-256 hex; NONE for NULL) in
+  one statement. NULL sources follow the existing varchar shadow convention (absent fields).
+* **Engine-enforced `@hash`**: the field is defined with
+  `ASSERT $value = crypto::sha256($this.<col>)` and a guarded `DEFINE EVENT` rejects bypass `UPDATE`s of
+  the source, `CREATE` without `@hash`, and `@hash` removal — a raw write that changes the source without
+  its shadows is **rejected by the engine at write time**. Raw SurrealQL writes to a shadowed column are
+  therefore not supported; use the ORM/qb. (A deliberate forgery that sets the source *and* a matching
+  `@hash` together still passes the engine — it requires intent; ops policy, not the driver, covers it.
+  `shadow_migration.health()` / `count_invalid_shadows` detect stale shadows Python-side and
+  `bench migrate` repairs them offline.)
+* **Migration** (`shadow_migration.py`): `bench migrate` runs `sync_all_table_shadows()` — per column:
+  define the shadow fields (without the ASSERT), backfill invalid rows in restartable batches (with a
+  mandatory no-progress guard), verify `count_invalid_shadows == 0`, re-define `@hash` with the ASSERT,
+  then write the version marker (`meta["csv"]`). Tables absent on a site are skipped silently. Online
+  (live-traffic) backfill is unsupported.
+* **Readiness**: a shadowed column is queryable only when synced + backfilled + version-current
+  (`shadow_ready`); otherwise every string-collation operation on it raises
+  `unsupported: <col> collation shadows not ready (run bench migrate)` — never an inline fallback.
+* **Extending the allow-list**: add one `TextCollationShadow(table, column)` to `BUILTIN` and run
+  `bench migrate`.
 
 ## Trying it
 
