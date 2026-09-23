@@ -316,6 +316,12 @@ class Renderer:
 
 	def _col(self, ctx: TableCtx, spec: ColumnSpec) -> Expr:
 		stored = physical(spec.name)
+		if spec.text_collation_shadow and not spec.shadow_ready:
+			# P1.15 §4.4: integrity not established for this column yet - every string-collation
+			# operation raises; there is no fallback to the inline lowercase path (invariant §2).
+			unsupported(
+				f"{spec.name} collation shadows not ready (run bench migrate)", "P1.15",
+			)
 		expr = Expr(ctx.prefix + quote(stored), spec)
 		if spec.has_collation_shadow:
 			expr.ci = ctx.prefix + quote(stored + SHADOW_CI)

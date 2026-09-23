@@ -159,6 +159,7 @@ class ColumnSpec:
 	custom_assert: str | None = None
 	order: int | None = None  # position in the table definition (SELECT * returns columns in this order)
 	text_collation_shadow: bool = False  # set only by specs()/table_schema_from_info() from the registry
+	shadow_ready: bool = True  # False = marked but shadows/marker not established (queries RAISE, P1.15 §4.4)
 	kind: str = field(init=False)
 	arg: tuple = field(init=False)
 
@@ -468,6 +469,16 @@ class SurrealDBTable(DBTable):
 			is_child=bool(istable),
 			sort_modified=(not istable and self.meta.sort_field == "modified"),
 		)
+
+	def sync(self):
+		super().sync()
+		if not self.meta.get("is_virtual"):
+			# P1.15: migrate the allow-listed text columns' shadows (define -> backfill -> verify ->
+			# ASSERT -> version marker -> enforcement event) after the table's own DDL, inside model
+			# sync and before post-sync patches run (P0.9).
+			from frappe.database.surrealdb import shadow_migration
+
+			shadow_migration.sync_table_shadows(self.table_name, self.specs(), db=frappe.db)
 
 	def create(self):
 		for stmt in self.statements():
@@ -924,10 +935,16 @@ def table_schema_from_info(table_name: str, info: dict) -> TableSchema:
 		spec = ColumnSpec(name, meta["t"], nullable=bool(meta["n"]), order=order)
 		if spec.is_text and text_shadows.is_shadowed(table_name, name):
 			# P1.15: the allow-list marks the column so every string-collation operation uses the
-			# stored shadows. Readiness gating (the version marker / missing fields) is added by the
-			# sync hook's readiness state - until then the shadow fields exist whenever this column
-			# was created/migrated by this driver, and writes maintain them.
+			# stored shadows. Readiness: the shadow fields exist in INFO and the source field carries
+			# the current version marker; a marked-but-pending column raises on query (never inline).
+			stored = physical(name)
+			fields = info.get("fields") or {}
+			present = all(
+				f"`{stored}{suffix}`" in fields or f"{stored}{suffix}" in fields
+				for suffix in (SHADOW_CI, SHADOW_LIKE, SHADOW_HASH)
+			)
 			spec.text_collation_shadow = True
+			spec.shadow_ready = present and meta.get("csv") == text_shadows.COLLATION_SHADOW_VERSION
 		columns[name] = spec
 	return TableSchema(table_name, columns, parsed.indexes)
 

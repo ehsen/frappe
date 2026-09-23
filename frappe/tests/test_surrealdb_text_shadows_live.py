@@ -1,13 +1,17 @@
 """P1.15 against a real SurrealDB: shadow DDL, storage invariants, the engine-enforced @hash bypass
 rejection, and rename/drop of shadowed columns (needs a server; skipped otherwise)."""
 
+import json
 import unittest
+from unittest import mock
 
 from pypika.queries import Table
 
+import frappe
 from frappe.database.surrealdb import collation as C
 from frappe.database.surrealdb import errors as E
 from frappe.database.surrealdb import schema as S
+from frappe.database.surrealdb import shadow_migration as MIG
 from frappe.database.surrealdb import text_shadows as TS
 from frappe.database.surrealdb.translator import render
 from frappe.query_builder.surrealdb_builder import SurrealDB
@@ -61,19 +65,15 @@ def kid_shadow_row(db, table, name):
 
 def invalid_count(db, table=TABLE):
 	"""Rows whose shadows or hash are missing/stale (the sync hook's predicate; the engine stores real
-	NULL for SQL NULL, P0.8-revised: both NONE and NULL are 'absent'). The in-engine check can verify
-	@hash (crypto::sha256) but not @ci/@like (ci_key/like_shadow are Python-only) — staleness of those
-	is the health command's (Python-side) job."""
+	NULL for SQL NULL, P0.8-revised: a NULL source carries its shadows as NULL, and an ABSENT shadow
+	fails every later UPDATE of the row, so absence - NONE - is what counts as invalid)."""
 	pred = (
-		"IF text_sh = NONE OR text_sh = NULL THEN "
-		"((`text_sh@ci` != NONE AND `text_sh@ci` != NULL) "
-		"OR (`text_sh@like` != NONE AND `text_sh@like` != NULL) "
-		"OR (`text_sh@hash` != NONE AND `text_sh@hash` != NULL)) "
-		"ELSE "
+		"IF (text_sh != NONE AND text_sh != NULL) THEN "
 		"(`text_sh@ci` = NONE OR `text_sh@ci` = NULL "
 		"OR `text_sh@like` = NONE OR `text_sh@like` = NULL "
 		"OR `text_sh@hash` = NONE OR `text_sh@hash` = NULL "
-		"OR `text_sh@hash` != crypto::sha256(text_sh)) END"
+		"OR `text_sh@hash` != crypto::sha256(text_sh)) "
+		"ELSE (`text_sh@ci` = NONE OR `text_sh@like` = NONE OR `text_sh@hash` = NONE) END"
 	)
 	rows = db.sql(f"SELECT count() AS n FROM `{table}` WHERE {pred} GROUP ALL /*cols:n*/")
 	return rows[0][0] if rows and rows[0][0] else 0
@@ -213,3 +213,181 @@ class TestSurrealDBTextShadowLive(LiveSurrealDB, UnitTestCase):
 		self.assertNotIn("`text_sh`", fields)
 		self.assertNotIn("`text_sh@ci`", fields)
 		self.assertNotIn("`text_sh@hash`", fields)
+
+
+class _FileMeta(frappe._dict):
+	"""The stand-in meta SurrealDBTable needs (same shape as setup_db._meta_from_file's)."""
+
+	def get(self, key, default=None):
+		return dict.get(self, key, default)
+
+	def get_fieldnames_with_value(self, with_field_meta=False, with_virtual_fields=False):
+		from frappe.model.meta import NO_VALUE_FIELDS
+
+		def is_value_field(df):
+			return df.get("fieldtype") not in NO_VALUE_FIELDS and (with_field_meta or not df.get("is_virtual"))
+
+		if with_field_meta:
+			return [df for df in self.fields if is_value_field(df)]
+		return [df["fieldname"] for df in self.fields if is_value_field(df)]
+
+
+def kid_meta():
+	return _FileMeta({
+		"name": "ParityKid",
+		"fields": [
+			{"fieldname": "title", "fieldtype": "Data"},
+			{"fieldname": "text_sh", "fieldtype": "Text"},
+			{"fieldname": "text", "fieldtype": "Long Text"},
+		],
+		"istable": 0,
+		"issingle": 0,
+		"autoname": None,
+		"sort_field": "creation",
+	})
+
+
+def kid_spec(db):
+	return S.table_schema(TABLE, db=db).column("text_sh")
+
+
+def _sync():
+	"""SurrealDBTable.sync() the way updatedb runs it: validate() populates current_columns first."""
+	table = S.SurrealDBTable("ParityKid", kid_meta())
+	table.validate()
+	table.sync()
+	return table
+
+@unittest.skipUnless(LIVE, SKIP_REASON)
+class TestSurrealDBTextShadowMigrationLive(LiveSurrealDB, UnitTestCase):
+	"""The pre-migration state is built raw (column without shadows, rows without keys), like a table
+	that predates the allow-list entry; every test then runs the real model-sync hook."""
+
+	def setUp(self):
+		db_name, db_user, password = self.new_site()
+		self.provision(db_name, db_user, password)
+		self.addCleanup(self._drop, db_name, db_user, password)
+		self.db = self.connect(db_name, db_user, password)
+		self.addCleanup(self.db.close)
+		# SurrealDBTable.sync() routes every DDL/backfill statement through frappe.db — on a SurrealDB
+		# site that IS the SurrealDB connection; the reference site is MariaDB, so bind ours for the test.
+		self._orig_db = frappe.local.db
+		frappe.local.db = self.db
+		self.addCleanup(setattr, frappe.local, "db", self._orig_db)
+		unmarked = [
+			S.ColumnSpec("title", "varchar(140)"),
+			S.ColumnSpec("text_sh", "text"),  # same logical type as the meta's Text (a longtext here
+			# would make alter() convert_column on every sync, pre-defining the shadows+ASSERT)
+			S.ColumnSpec("text", "longtext"),
+			# the optional columns model sync adds to non-table doctypes: they must pre-exist here,
+			# because a `string | null` field defined after rows exist leaves those rows holding the
+			# field as NONE, which fails every later UPDATE of the row (SurrealDB 3.2.4, measured)
+			S.ColumnSpec("_user_tags", "text"),
+			S.ColumnSpec("_comments", "text"),
+			S.ColumnSpec("_assign", "text"),
+			S.ColumnSpec("_liked_by", "text"),
+		]
+		for stmt in S.create_statements(TABLE, unmarked):
+			self.db.sql_ddl(stmt)
+		# the raw CREATEs don't invalidate the per-site "db_tables" client cache (shared across the
+		# throwaway sites in this process); drop it so is_new() sees this site's fresh table list
+		frappe.client_cache.delete_value("db_tables")
+		for name, value in (("M1", "Äpple"), ("M2", "straße"), ("M3", None)):
+			sets = {"name": name, "name@ci": C.ci_key(name), "name@like": C.like_shadow(name), "text_sh": value}
+			assignments = ", ".join(f"`{k}` = ${'p%d' % i}" for i, k in enumerate(sets))
+			params = {f"p{i}": v for i, v in enumerate(sets.values())}
+			params["tb"], params["rid"] = TABLE, C.record_id(name)
+			self.db.sql(f"CREATE type::record($tb, $rid) SET {assignments}", params)
+		S.clear_schema_cache()
+
+	def _drop(self, db_name, db_user, password):
+		from frappe.database.surrealdb import setup_db
+
+		with self._site_conf(db_name, db_user, password):
+			setup_db.drop_user_and_database(db_name, db_user)
+
+	def test_sync_backfills_verifies_marks_and_enforces(self):
+		_sync()
+		fields = (self.db._info(f"INFO FOR TABLE `{TABLE}`").get("fields") or {})
+		for key in ("`text_sh@ci`", "`text_sh@like`", "`text_sh@hash`"):
+			self.assertIn(key, fields)
+		self.assertIn(
+			"ASSERT (IF $value = NONE OR $value = NULL THEN true ELSE $value = crypto::sha256($this.text_sh) END)",
+			fields["`text_sh@hash`"],
+		)
+		self.assertEqual(S.parse_field_meta(fields["text_sh"]).get("csv"), TS.COLLATION_SHADOW_VERSION)
+		self.assertIn("p115_text_sh", (self.db._info(f"INFO FOR TABLE `{TABLE}`").get("events") or {}))
+		self.assertEqual(MIG.count_invalid_shadows(TABLE, kid_spec(self.db), self.db), 0)
+		s, ci, lk, h = kid_shadow_row(self.db, TABLE, "M1")
+		self.assertEqual((ci, lk, h), (C.ci_key("Äpple"), C.like_shadow("Äpple"), TS.source_hash("Äpple")))
+		self.assertIsNone(kid_shadow_row(self.db, TABLE, "M3")[3])  # the NULL row: shadows stay absent
+		kid_insert(self.db, TABLE, "M4", text_sh="neu")
+		self.assertEqual(MIG.count_invalid_shadows(TABLE, kid_spec(self.db), self.db), 0)
+		with self.assertRaises(E.SurrealDBError):
+			self.db.sql(f"UPDATE `{TABLE}` SET text_sh = 'bypass' WHERE name = 'M4'")
+
+	def test_sync_is_idempotent(self):
+		_sync()
+		with mock.patch.object(MIG, "backfill_column", wraps=MIG.backfill_column) as spy:
+			_sync()
+			spy.assert_not_called()
+		self.assertEqual(MIG.count_invalid_shadows(TABLE, kid_spec(self.db), self.db), 0)
+
+	def test_backfill_is_restartable(self):
+		real = MIG._update_row
+		calls = {"n": 0}
+
+		def flaky(db, table, spec, rid, value):
+			calls["n"] += 1
+			if calls["n"] > 1:
+				raise RuntimeError("injected crash mid-backfill")
+			return real(db, table, spec, rid, value)
+
+		with mock.patch.object(MIG, "_update_row", flaky):
+			with self.assertRaises(RuntimeError):
+				_sync()
+		_sync()  # re-run to completion
+		self.assertEqual(MIG.count_invalid_shadows(TABLE, kid_spec(self.db), self.db), 0)
+
+	def test_stall_guard_raises_with_sample_ids(self):
+		real_hash = TS.source_hash
+
+		def poisoned(value):
+			h = real_hash(value)
+			return h[:-1] + ("0" if h[-1] != "0" else "1")
+
+		with mock.patch.object(TS, "source_hash", poisoned):
+			with self.assertRaises(MIG.ShadowBackfillStalled) as ctx:
+				_sync()
+			self.assertIn("made no progress", str(ctx.exception))
+
+	def test_version_bump_forces_rebackfill(self):
+		_sync()
+		with mock.patch.object(TS, "COLLATION_SHADOW_VERSION", 2), \
+			 mock.patch.object(MIG, "backfill_column", wraps=MIG.backfill_column) as spy:
+			_sync()
+			spy.assert_called_once()
+			self.assertTrue(spy.call_args.kwargs.get("force"))
+		fields = (self.db._info(f"INFO FOR TABLE `{TABLE}`").get("fields") or {})
+		self.assertEqual(S.parse_field_meta(fields["text_sh"]).get("csv"), 2)
+		self.assertEqual(MIG.count_invalid_shadows(TABLE, kid_spec(self.db), self.db), 0)
+
+	def test_pending_column_raises_not_ready(self):
+		_sync()
+		fields = (self.db._info(f"INFO FOR TABLE `{TABLE}`").get("fields") or {})
+		meta = S.parse_field_meta(fields["text_sh"])
+		meta.pop("csv", None)
+		strip = MIG._COMMENT_TOKEN.sub(
+			f"COMMENT {S.surql_string(json.dumps(meta, separators=(',', ':'), ensure_ascii=False))}",
+			fields["text_sh"], count=1,
+		)
+		if " OVERWRITE " not in strip.split("COMMENT")[0]:
+			strip = strip.replace("DEFINE FIELD ", "DEFINE FIELD OVERWRITE ", 1)
+		self.db.sql_ddl(strip)
+		S.clear_schema_cache()
+		self.assertFalse(S.table_schema(TABLE, db=self.db).column("text_sh").shadow_ready)
+		with self.assertRaises(E.SurrealDBNotImplementedError):
+			run(self.db, SurrealDB.from_(T).select(T.name).where(T.text_sh == "x"))
+		_sync()  # migrate re-establishes readiness
+		S.clear_schema_cache()
+		self.assertTrue(S.table_schema(TABLE, db=self.db).column("text_sh").shadow_ready)
