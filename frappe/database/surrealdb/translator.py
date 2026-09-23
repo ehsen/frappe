@@ -42,6 +42,7 @@ from pypika.terms import (
 	BetweenCriterion,
 	ComplexCriterion,
 	ContainsCriterion,
+	Function,
 	Node,
 	Not,
 	NotNullCriterion,
@@ -241,6 +242,11 @@ _FRAG_OP = {
 }
 
 
+# The SQL functions a raw fragment may call: exactly the ones the ordinary expression machinery
+# maps (chunk P1.6d.2) - everything else keeps the fragment parser's fail-closed 1054.
+_FRAG_FUNCTIONS = frozenset("IFNULL COALESCE CONCAT CONCAT_WS NULLIF ROUND TRUNCATE".split())
+
+
 class _FragmentParser:
 	"""Recursive-descent parser for the raw SQL fragments Frappe embeds as `RawCriterion` /
 	`CombinedRawCriterion` (permission query conditions, `build_match_conditions`, ad-hoc
@@ -249,7 +255,7 @@ class _FragmentParser:
 	The fragment text is parsed into a PyPika criterion tree which the ordinary `predicate()` then
 	renders, so every leaf goes through the same BasicCriterion machinery as a typed query - the
 	same bound values, collation shadows, NULL guards and fail-closed rules. MariaDB syntax the
-	parser does not know (functions, sub-queries, arithmetic, EXISTS, %s placeholders) raises; a
+	parser does not know (sub-queries, EXISTS, arithmetic, %s placeholders) raises; mapped functions parse too (P1.6d.2); a
 	fragment is never approximated."""
 
 	_TOKEN = re.compile(
@@ -410,12 +416,32 @@ class _FragmentParser:
 				return self._fragment_field(first, second)
 			if kind == "word":
 				up = first.upper()
+				_, nt = self._peek()
+				if nt == "(" and up in _FRAG_FUNCTIONS:
+					return self._fragment_function(up)
 				if up == "NULL":
 					return NullValue()
 				if up in ("TRUE", "FALSE"):
 					return ValueWrapper(up == "TRUE")
 			return self._fragment_field(None, first)
 		unsupported(f"an operand {token!r} in the SQL fragment", P1_6D)
+
+	def _fragment_function(self, name):
+		"""A function call in a SQL fragment (chunk P1.6d.2): only functions the ordinary expression
+		machinery maps (`IFNULL`, `COALESCE`, `CONCAT`, ...) are accepted - they build PyPika Function
+		terms and render through `_function`, exactly like a typed query. Every other function word
+		stays refused (it falls through to the unknown-column 1054; a fragment is never approximated)."""
+		self.i += 1  # the '('
+		args = []
+		if not self._punct(")"):
+			while True:
+				args.append(self._operand())
+				if self._punct(","):
+					continue
+				if not self._punct(")"):
+					unsupported(f"a missing ')' of the {name}(...) arguments in the SQL fragment", P1_6D)
+				break
+		return Function(name, *args)
 
 	def _fragment_field(self, table, name):
 		"""Resolve `table`.`name` (or a bare column) against the query's tables, mirroring `_owner`."""

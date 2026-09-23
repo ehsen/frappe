@@ -1054,8 +1054,21 @@ class TestFragmentParser(UnitTestCase):
 		from frappe.database.query import RawCriterion
 
 		with self.assertRaises(SurrealDBProgrammingError) as cm:
-			r(SurrealDB.from_(T).select(T.name).where(RawCriterion("concat(title, name) = 'x'")))
+			r(SurrealDB.from_(T).select(T.name).where(RawCriterion("locate(title, name) = 'x'")))
 		self.assertEqual(cm.exception.args[0], 1054)
+
+	def test_fragment_functions_parse_through_the_ordinary_machinery(self):
+		"""Chunk P1.6d.2: mapped functions (`IFNULL`, `COALESCE`, ...) in a raw fragment build PyPika
+		Function terms and render exactly like a typed query - same shadows, guards and fail-closed
+		rules. An unmapped function stays refused (1054)."""
+		from frappe.database.query import RawCriterion
+
+		sql, _ = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("ifnull(`tabDoc`.title, '') = 'x'")))
+		self.assertIn("(`title@ci` ?? $param2) = $param4", sql)
+		sql, _ = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("coalesce(`tabDoc`.qty, 0) > 2")))
+		self.assertIn("(`qty` ?? $param1) != NULL AND (`qty` ?? $param1) != NONE AND (`qty` ?? $param1) > $param2", sql)
+		sql, _ = r(SurrealDB.from_(T).select(T.name).where(RawCriterion("ifnull(`tabDoc`.title, '') not like 'a%'")))
+		self.assertIn("string::matches((`title@like` ?? $param3), $param4)", sql)
 
 	def test_unknown_table_fails_closed(self):
 		from frappe.database.query import RawCriterion
@@ -1158,7 +1171,7 @@ class TestLegacySql(UnitTestCase):
 			"select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`name` = %s",
 			"select `tabDoc`.`name` from `tabDoc` join `tabNote` on `tabNote`.`parent` = `tabDoc`.`name`",
 			"select `tabDoc`.`name` from `tabDoc` where exists (select 'x' from `tabNote` n where n.parent = `tabDoc`.`name`)",
-			"select `tabDoc`.`name` from `tabDoc` where coalesce(`tabDoc`.`title`, '') = ''",
+			"select `tabDoc`.`name`, locate('x', `tabDoc`.`name`) as r from `tabDoc`",
 			"select `tabDoc`.`title`, count(*) from `tabDoc` group by `tabDoc`.`title`",
 		):
 			self.assertIsNone(legacy_sql.rewrite(query, None, loader), query)
