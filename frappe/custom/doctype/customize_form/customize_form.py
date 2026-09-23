@@ -605,14 +605,27 @@ class CustomizeForm(Document):
 			df = field.get("df")
 			max_length = cint(frappe.db.type_map.get(df.fieldtype)[1])
 			fieldname = df.fieldname
-			docs = frappe.db.sql(
-				f"""
-				SELECT name, {fieldname}, LENGTH({fieldname}) AS len
-				FROM `tab{self.doc_type}`
-				WHERE LENGTH({fieldname}) > {max_length}
-			""",
-				as_dict=True,
-			)
+			if frappe.db.db_type == "surrealdb":
+				# P1.9c: LENGTH() has no qb equivalent on SurrealDB and raw SQL must
+				# not touch collation-shadowed columns - fetch the values and compare
+				# lengths in Python instead.
+				rows = frappe.get_all(
+					self.doc_type, filters=[[fieldname, "is", "set"]], fields=["name", fieldname]
+				)
+				docs = [
+					frappe._dict(name=row["name"], **{fieldname: row[fieldname]})
+					for row in rows
+					if len(str(row[fieldname] or "")) > max_length
+				]
+			else:
+				docs = frappe.db.sql(
+					f"""
+					SELECT name, {fieldname}, LENGTH({fieldname}) AS len
+					FROM `tab{self.doc_type}`
+					WHERE LENGTH({fieldname}) > {max_length}
+				""",
+					as_dict=True,
+				)
 			label = df.label
 			links_str = ", ".join(frappe.utils.get_link_to_form(self.doc_type, doc.name) for doc in docs)
 

@@ -394,7 +394,9 @@ def update_contact(doc, method):
 def contact_query(
 	doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict[str, Any]
 ):
-	from frappe.desk.reportview import get_match_cond
+	from pypika import Order
+
+	from frappe.database.query import Engine
 
 	doctype = "Contact"
 	if not frappe.get_meta(doctype).get_field(searchfield) and searchfield not in frappe.db.DEFAULT_COLUMNS:
@@ -402,6 +404,50 @@ def contact_query(
 
 	link_doctype = filters.pop("link_doctype", None)
 	link_name = filters.pop("link_name", None)
+
+	if frappe.db.db_type == "surrealdb":
+		# P1.9c: the raw SQL below is not portable to SurrealDB - varchar columns are
+		# collation-shadowed (raw =/LIKE on them is broken) and there is no locate()
+		# for the relevance ordering. Rebuild with qb; permission fragments come from
+		# Engine.get_permission_conditions (qb Criterion) instead of
+		# reportview.get_match_cond (raw text). Relevance ordering degrades to
+		# idx/full_name since SurrealDB has no string-position function here.
+		if not link_doctype or not link_name:
+			return []
+
+		contact = frappe.qb.DocType(doctype)
+		link = frappe.qb.DocType("Dynamic Link")
+
+		query = (
+			frappe.qb.from_(contact)
+			.join(link)
+			.on(link.parent == contact.name)
+			.select(contact.name, contact.full_name, contact.company_name)
+			.where(link.parenttype == doctype)
+			.where(link.link_doctype == link_doctype)
+			.where(link.link_name == link_name)
+			.where(contact[searchfield].like("%" + txt + "%"))
+			.orderby(contact.idx, order=Order.desc)
+			.orderby(contact.full_name)
+			.limit(page_len)
+			.offset(start)
+		)
+		engine = Engine()
+		# get_query() seeds these on the engine; we drive the permission
+		# helpers directly, so seed the attributes they introspect.
+		engine.doctype = doctype
+		engine.user = frappe.session.user
+		engine.parent_doctype = None
+		engine.reference_doctype = None
+		engine.ignore_user_permissions = False
+		engine.query = query  # get_queried_tables() reads query._from/_joins
+		if condition := engine.get_permission_conditions(doctype, contact):
+			query = query.where(condition)
+		return query.run()
+
+	# Upstream imports this inside contact_query; the qb branch above returns
+	# first on surrealdb, but the raw path below still needs it on MariaDB.
+	from frappe.desk.reportview import get_match_cond
 
 	return frappe.db.sql(
 		f"""select

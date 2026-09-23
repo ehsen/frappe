@@ -100,6 +100,25 @@ def get_level_class(level):
 
 def get_sidebar_items():
 	def _get():
+		if frappe.db.db_type == "surrealdb":
+			# P1.9c: the raw SQL leans on MariaDB's concat() with mixed types,
+			# which has no SurrealDB translation; build the display title in
+			# Python from a plain qb select instead.
+			from pypika import Order
+
+			category = frappe.qb.DocType("Help Category")
+			rows = (
+				frappe.qb.from_(category)
+				.select(category.category_name, category.route, category.help_articles)
+				.where(category.published == 1)
+				.where(category.help_articles > 0)
+				.orderby(category.help_articles, order=Order.desc)
+				.run()
+			)
+			return [
+				frappe._dict(title=f"{name} ({count})", route="/" + route)
+				for name, route, count in rows
+			]
 		return frappe.db.sql(
 			"""select
 				concat(category_name, " (", help_articles, ")") as title,

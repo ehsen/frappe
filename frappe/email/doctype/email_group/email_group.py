@@ -7,6 +7,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.utils import parse_addr, validate_email_address
+from frappe.query_builder.functions import Count
 
 
 class EmailGroup(Document):
@@ -78,10 +79,9 @@ class EmailGroup(Document):
 		return self.total_subscribers
 
 	def get_total_subscribers(self):
-		return frappe.db.sql(
-			"""select count(*) from `tabEmail Group Member`
-			where email_group=%s""",
-			self.name,
+		member = frappe.qb.DocType("Email Group Member")
+		return (
+			frappe.qb.from_(member).select(Count("*")).where(member.email_group == self.name).run()
 		)[0][0]
 
 	@frappe.whitelist()

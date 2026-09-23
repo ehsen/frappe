@@ -42,6 +42,9 @@ def get_random(doctype: str, filters: dict | None = None, doc: bool = False):
 	out = frappe.db.multisql(
 		{
 			"mariadb": f"select name from `tab{doctype}` {condition} order by RAND() limit 1 offset 0",
+			# P1.9c: SurrealDB exposes rand() (not RANDOM()) and this raw statement
+			# cannot carry OFFSET here; offset is hardcoded 0 upstream anyway.
+			"surrealdb": f"select name from `tab{doctype}` {condition} order by rand() limit 1",
 			"*": f"select name from `tab{doctype}` {condition} order by RANDOM() limit 1 offset 0",
 		}
 	)

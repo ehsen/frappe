@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal, Optional
 
 import frappe
+from frappe.utils import cstr
 
 if TYPE_CHECKING:
 	from frappe.email.doctype.email_queue.email_queue import EmailQueue
@@ -51,29 +52,36 @@ def get_contact_list(txt: str, page_length: int = 20, extra_filters: str | None 
 
 
 def get_system_managers():
-	return frappe.db.sql_list(
-		"""select parent FROM `tabHas Role`
-		WHERE role='System Manager'
-		AND parent!='Administrator'
-		AND parent IN (SELECT email FROM tabUser WHERE enabled=1)"""
-	)
+	user = frappe.qb.DocType("User")
+	has_role = frappe.qb.DocType("Has Role")
+
+	subquery = frappe.qb.from_(user).select(user.email).where(user.enabled == 1)
+
+	return (
+		frappe.qb.from_(has_role)
+		.select(has_role.parent)
+		.where(
+			(has_role.role == "System Manager")
+			& (has_role.parent != "Administrator")
+			& has_role.parent.isin(subquery)
+		)
+	).run(pluck=True)
 
 
 @frappe.whitelist()
 def relink(name: str, reference_doctype: str | None = None, reference_name: str | int | None = None):
 	frappe.has_permission("Communication", "write", name, throw=True)
-	frappe.db.sql(
-		"""update
-			`tabCommunication`
-		set
-			reference_doctype = %s,
-			reference_name = %s,
-			status = "Linked"
-		where
-			communication_type = "Communication" and
-			name = %s""",
-		(reference_doctype, reference_name, name),
-	)
+
+	communication = frappe.qb.DocType("Communication")
+	frappe.qb.update(communication).set(
+		communication.reference_doctype, reference_doctype
+	).set(
+		communication.reference_name, cstr(reference_name)
+	).set(
+		communication.status, "Linked"
+	).where(
+		communication.communication_type == "Communication"
+	).where(communication.name == cstr(name)).run()
 
 
 @frappe.whitelist()

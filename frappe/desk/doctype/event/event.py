@@ -339,6 +339,183 @@ def send_event_digest():
 			)
 
 
+def _get_events_qb(start, end, target_user, filters, for_reminder):
+	"""P1.9c: SurrealDB variant of the raw SQL in get_events().
+
+	The MariaDB SQL uses date() wrapping, %(param)s placeholder binding and a raw
+	text filter_condition - none of which are portable to SurrealDB. The same
+	query is rebuilt here from qb ASTs only (no text fragments).
+	"""
+	from datetime import time as dt_time, timedelta
+
+	from frappe.utils import cint, get_datetime
+
+	Event = frappe.qb.DocType("Event")
+	share = frappe.qb.DocType("DocShare")
+
+	start_dt = datetime.combine(start, dt_time.min)
+	end_dt = datetime.combine(end, dt_time.min)
+	start_next = start_dt + timedelta(days=1)
+	end_next = end_dt + timedelta(days=1)
+
+	query = (
+		frappe.qb.from_(Event)
+		.select(
+			Event.name,
+			Event.subject,
+			Event.description,
+			Event.color,
+			Event.starts_on,
+			Event.ends_on,
+			Event.owner,
+			Event.all_day,
+			Event.event_type,
+			Event.repeat_this_event,
+			Event.repeat_on,
+			Event.repeat_till,
+			Event.monday,
+			Event.tuesday,
+			Event.wednesday,
+			Event.thursday,
+			Event.friday,
+			Event.saturday,
+			Event.sunday,
+		)
+		.where(
+			(
+				(Event.starts_on >= start_dt) & (Event.starts_on < end_next)
+			)
+			| ((Event.ends_on >= start_dt) & (Event.ends_on < end_next))
+			| ((Event.starts_on < start_next) & (Event.ends_on >= end_dt))
+			| (
+				(Event.starts_on < start_next)
+				& (Event.repeat_this_event == 1)
+				& (Event.repeat_till.isnull() | (Event.repeat_till > start_dt))
+			)
+		)
+		.where(
+			(Event.event_type == "Public")
+			| (Event.owner == target_user)
+			| Event.name.isin(
+				frappe.qb.from_(share)
+				.select(share.share_name)
+				.where(share.share_doctype == "Event")
+				.where(share.user == target_user)
+			)
+		)
+		.where(Event.status == "Open")
+		.orderby(Event.starts_on)
+	)
+
+	if for_reminder:
+		query = query.where(Event.send_reminder == 1)
+
+	if filters:
+		for flt in _normalize_event_filters(filters):
+			if flt[0] == "Event Participants":
+				part = frappe.qb.DocType("Event Participants")
+				query = query.where(
+					Event.name.isin(
+						frappe.qb.from_(part)
+						.select(part.parent)
+						.where(part.parenttype == "Event")
+						.where(part[flt[1]] == flt[3])
+					)
+				)
+			else:
+				query = query.where(_event_filter_criterion(Event, flt))
+
+	data = query.run() or []
+
+	# qb .run() yields positional tuples - rebuild dicts in select order.
+	fields = (
+		"name",
+		"subject",
+		"description",
+		"color",
+		"starts_on",
+		"ends_on",
+		"owner",
+		"all_day",
+		"event_type",
+		"repeat_this_event",
+		"repeat_on",
+		"repeat_till",
+		"monday",
+		"tuesday",
+		"wednesday",
+		"thursday",
+		"friday",
+		"saturday",
+		"sunday",
+	)
+	rows = [frappe._dict(zip(fields, row)) for row in data]
+
+	# Post-processing (resolve_event) calls .date()/.time() on these; the chain
+	# may hand raw strings back, so normalize before returning.
+	for e in rows:
+		for key in ("starts_on", "ends_on", "repeat_till"):
+			value = e.get(key)
+			if value and isinstance(value, str):
+				e[key] = get_datetime(value)
+		for key in weekdays:
+			e[key] = cint(e.get(key))
+
+	return rows
+
+
+def _normalize_event_filters(filters):
+	"""Normalize calendar filters into [doctype, field, op, value] rows."""
+	if isinstance(filters, str):
+		filters = json.loads(filters)
+
+	ops = ("=", "!=", ">", "<", ">=", "<=", "like", "not like", "in", "not in")
+
+	out = []
+	if isinstance(filters, dict):
+		for field, value in filters.items():
+			if (
+				isinstance(value, list | tuple)
+				and len(value) == 2
+				and isinstance(value[0], str)
+				and value[0].lower() in ops
+			):
+				out.append(["Event", field, value[0], value[1]])
+			else:
+				out.append(["Event", field, "=", value])
+	elif isinstance(filters, list | tuple):
+		for row in filters:
+			if not isinstance(row, list | tuple):
+				continue
+			if len(row) == 4 and row[0] in ("Event", "Event Participants"):
+				out.append(list(row))
+			elif len(row) == 3:
+				out.append(["Event", row[0], row[1], row[2]])
+			elif len(row) == 4:
+				out.append(["Event", row[0], row[1], row[2], row[3]][1:])
+	return out
+
+
+def _event_filter_criterion(Event, flt):
+	_, field, op, value = flt
+	op = op.lower()
+	if op in ("=", "=="):
+		return Event[field] == value
+	if op == "!=":
+		return Event[field] != value
+	if op in (">", ">=", "<", "<="):
+		return getattr(Event[field], {"<": "lt", "<=": "lte", ">": "gt", ">=": "gte"}[op])(value)
+	if op == "like":
+		return Event[field].like(value)
+	if op == "not like":
+		return ~Event[field].like(value)
+	if op == "in":
+		return Event[field].isin(value)
+	if op == "not in":
+		return ~Event[field].isin(value)
+	return Event[field] == value
+
+
 @frappe.whitelist()
 @http_cache(max_age=5 * 60, stale_while_revalidate=60 * 60)
 def get_events(
@@ -360,6 +537,14 @@ def get_events(
 
 	if isinstance(filters, str):
 		filters = json.loads(filters)
+
+	if frappe.db.db_type == "surrealdb":
+		# P1.9c: the raw SQL below is MariaDB-flavoured (date() wrapping,
+		# %(param)s placeholders, text filter_condition) and is not portable
+		# to SurrealDB. Rebuild the same query from qb ASTs. This must also
+		# short-circuit BEFORE reportview.get_filters_cond: it interpolates
+		# values via frappe.db.escape, which is fail-closed on this backend.
+		return _get_events_qb(start, end, target_user, filters, for_reminder)
 
 	filter_condition = get_filters_cond("Event", filters, [])
 

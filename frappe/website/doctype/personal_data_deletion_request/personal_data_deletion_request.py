@@ -10,6 +10,7 @@ from frappe.core.utils import find
 from frappe.desk.doctype.notification_settings.notification_settings import is_email_notifications_enabled
 from frappe.model.document import Document
 from frappe.utils import get_datetime, get_fullname, time_diff_in_hours
+from frappe.utils.data import add_to_date, now_datetime
 from frappe.utils.user import get_system_managers
 from frappe.utils.verified_command import get_signed_params, verify_request
 
@@ -336,6 +337,30 @@ class PersonalDataDeletionRequest(Document):
 				f" 'REDACTED'), %(email)s, '{self.anon}')",
 			]
 
+		if frappe.db.db_type == "surrealdb":
+			# P1.9c: the editable text columns are collation-shadowed on SurrealDB (P1.15) and the
+			# qb layer has no REPLACE() function, so the partial-match redaction is applied per
+			# document through db.set_value (which maintains the shadows). The nested SQL
+			# REPLACE(REPLACE(col, name, 'REDACTED'), email, anon) order is preserved.
+			fieldnames = [
+				df.fieldname for df in frappe.get_meta(doctype["doctype"]).fields if df.fieldtype in editable_text_fields
+			]
+			filters = {}
+			if not doctype.get("strict"):
+				filters[doctype.get("filter_by", "owner")] = self.email
+			for row in frappe.get_all(doctype["doctype"], filters=filters, fields=["name", *fieldnames]):
+				updates = {}
+				for fieldname in fieldnames:
+					text = row.get(fieldname)
+					if not text:
+						continue
+					redacted = text.replace(self.full_name, "REDACTED").replace(self.email, self.anon)
+					if redacted != text:
+						updates[fieldname] = redacted
+				if updates:
+					frappe.db.set_value(doctype["doctype"], row.name, updates)
+			return
+
 		update_predicate = f"SET  {', '.join(match_fields)}"
 		where_predicate = (
 			"" if doctype.get("strict") else f"WHERE `{doctype.get('filter_by', 'owner')}` = %(email)s"
@@ -373,11 +398,14 @@ def process_data_deletion_request():
 
 
 def remove_unverified_record():
-	frappe.db.sql(
-		"""
-		DELETE FROM `tabPersonal Data Deletion Request`
-		WHERE `status` = 'Pending Verification'
-		AND `creation` < (NOW() - INTERVAL '7' DAY)"""
+	dt = frappe.qb.DocType("Personal Data Deletion Request")
+
+	(
+		frappe.qb.from_(dt)
+		.delete()
+		.where(dt.status == "Pending Verification")
+		.where(dt.creation < add_to_date(now_datetime(), days=-7))
+		.run()
 	)
 
 

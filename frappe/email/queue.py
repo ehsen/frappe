@@ -5,6 +5,8 @@ from datetime import timedelta
 import frappe
 from frappe import _, msgprint
 from frappe.utils import cint, cstr, get_url, now_datetime
+from pypika import Order
+
 from frappe.utils.data import add_to_date, getdate
 from frappe.utils.verified_command import get_signed_params, verify_request
 
@@ -41,26 +43,22 @@ def get_emails_sent_today(email_account=None):
 
 	if email_account=None, email account filter is not applied while counting
 	"""
-	q = """
-		SELECT
-			COUNT(`name`)
-		FROM
-			`tabEmail Queue`
-		WHERE
-			`status` in ('Sent', 'Not Sent', 'Sending')
-			AND
-			`creation` > (NOW() - INTERVAL '24' HOUR)
-	"""
+	from frappe.query_builder.functions import Count
 
-	q_args = {}
+	q = frappe.qb.DocType("Email Queue")
+	query = (
+		frappe.qb.from_(q)
+		.select(Count(q.name))
+		.where(q.status.isin(["Sent", "Not Sent", "Sending"]))
+		.where(q.creation > add_to_date(now_datetime(), hours=-24))
+	)
 	if email_account is not None:
 		if email_account:
-			q += " AND email_account = %(email_account)s"
-			q_args["email_account"] = email_account
+			query = query.where(q.email_account == email_account)
 		else:
-			q += " AND (email_account is null OR email_account='')"
+			query = query.where((q.email_account.isnull()) | (q.email_account == ""))
 
-	return frappe.db.sql(q, q_args)[0][0]
+	return query.run()[0][0]
 
 
 def get_unsubscribe_message(unsubscribe_message: str, expose_recipients: str) -> "frappe._dict[str, str]":
@@ -165,20 +163,19 @@ def get_queue():
 	batch_size = cint(frappe.conf.email_queue_batch_size) or 500
 	undo_window = add_to_date(now_datetime(), seconds=-10)
 
-	return frappe.db.sql(
-		"""select
-			name, sender
-		from
-			`tabEmail Queue`
-		where
-			(status='Not Sent' or status='Partially Sent') and
-			(send_after is null or send_after < %(now)s) and
-			(creation < %(undo_window)s)
-		order
-			by priority desc, retry asc, creation asc
-		limit %(batch_size)s""",
-		{"now": now_datetime(), "undo_window": undo_window, "batch_size": batch_size},
-		as_dict=True,
+	q = frappe.qb.DocType("Email Queue")
+
+	return (
+		frappe.qb.from_(q)
+		.select(q.name, q.sender)
+		.where(q.status.isin(["Not Sent", "Partially Sent"]))
+		.where((q.send_after.isnull()) | (q.send_after < now_datetime()))
+		.where(q.creation < undo_window)
+		.orderby(q.priority, order=Order.desc)
+		.orderby(q.retry)
+		.orderby(q.creation)
+		.limit(batch_size)
+		.run(as_dict=True)
 	)
 
 

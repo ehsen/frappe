@@ -42,6 +42,9 @@ class TextCollationShadow:
 BUILTIN: frozenset[TextCollationShadow] = frozenset({
 	TextCollationShadow("tabToDo", "description"),
 	TextCollationShadow("tabComment", "content"),
+	# P1.9c: contact_query link search does `full_name LIKE '%txt%'` for every
+	# Contact link field; without the shadows it fail-closes on the LIKE gate.
+	TextCollationShadow("tabContact", "full_name"),
 })
 
 _registered: set[TextCollationShadow] = set()
