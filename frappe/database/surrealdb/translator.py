@@ -99,6 +99,13 @@ def _kind(term) -> str:
 	return type(term).__name__
 
 
+def _query_of(container):
+	"""Frappe's `SubQuery` criterion wraps the real `QueryBuilder` (note.py's unseen-notes login check and
+	listview.py's ToDo filter build their sub-queries through it); accept the wrapper wherever a bare
+	sub-query is expected."""
+	return container.subq if _kind(container) == "SubQuery" else container
+
+
 def _sql_word(comparator) -> str:
 	return str(getattr(comparator, "value", comparator)).strip().lower()
 
@@ -1125,7 +1132,7 @@ class Renderer:
 	def _contains(self, term, negate: bool) -> str:
 		negate = negate != bool(getattr(term, "_is_negated", False))
 		left = self.expr(term.term)
-		container = term.container
+		container = _query_of(term.container)
 		if isinstance(container, QueryBuilder):
 			return self._in_subquery(left, container, negate)
 		if _kind(container) != "Tuple":
@@ -1280,7 +1287,7 @@ class Renderer:
 		child = self._child()
 		child._key_projection = False
 		child.correlated = OuterScope(self, child)
-		rows = child.select(term.container, hints=False)
+		rows = child.select(_query_of(term.container), hints=False)
 		if not child.correlated.bound:
 			name = self._hoist(rows)
 			return f"array::len({name}) {'=' if negate else '>'} 0"

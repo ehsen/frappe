@@ -833,6 +833,68 @@ class TestSurrealDBParityP16c(TestSurrealDBParityLive):
 			self.both(label, build, failures)
 		self.report(failures, "correlated sub-query cases")
 
+	def test_correlated_not_in_and_subquery_wrapper(self):
+		# P1.14: the NOT IN variants and frappe's `SubQuery` wrapper (note.py's unseen-notes login check,
+		# listview.py's ToDo filter). The kid fixture carries case-variant and NULL items, so this also
+		# proves the three-valued NOT IN semantics against MariaDB (a NULL in the set defeats every match
+		# unless the set is empty for that row).
+		from frappe.query_builder.terms import ParameterizedValueWrapper, SubQuery
+
+		p, k = T, K
+		cases = {
+			"correlated NOT IN (column left)": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(p.title.notin(Q.from_(k).select(k.item).where(k.parent == p.name)))
+			.orderby(p.name),
+			"login check (param needle NOT IN SubQuery)": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(
+				ParameterizedValueWrapper("Widget").notin(
+					SubQuery(Q.from_(k).select(k.item).where(k.parent == p.name))
+				)
+			)
+			.orderby(p.name),
+			"IN twin (param needle isin SubQuery)": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(
+				ParameterizedValueWrapper("Widget").isin(
+					SubQuery(Q.from_(k).select(k.item).where(k.parent == p.name))
+				)
+			)
+			.orderby(p.name),
+			"uncorrelated NOT IN over SubQuery": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(p.title.notin(SubQuery(Q.from_(k).select(k.item))))
+			.orderby(p.name),
+			"listview ToDo filter shape (column isin SubQuery)": lambda Q: Q.from_(p)
+			.select(p.name)
+			.where(p.name.isin(SubQuery(Q.from_(k).select(k.parent).where(k.parenttype == "Doc"))))
+			.orderby(p.name),
+		}
+		failures = []
+		for label, build in cases.items():
+			self.both(label, build, failures)
+		self.report(failures, "NOT IN / SubQuery-wrapper cases")
+
+	def test_translate_messages_comma_join_shape(self):
+		# P1.14: translate.py `get_messages_for_app` - the 2-table comma join with an IN-list conjunct on
+		# the first table (runs while collecting translatable report names). P1.13's comma-join machinery
+		# answers it; this pins the real framework shape against MariaDB.
+		p, k = T, K
+		failures = []
+
+		def build(Q):
+			return (
+				Q.from_(p)
+				.from_(k)
+				.where((k.parent == p.name) & p.title.isin(["Widget", "GADGET", "日本"]))
+				.select(k.name)
+				.orderby(k.name)
+			)
+
+		self.both("translate comma join", build, failures)
+		self.report(failures, "translate comma-join shape")
+
 	def test_correlated_scalar_subquery(self):
 		# P1.6c: a scalar sub-query that reads the outer row is evaluated once per row (the `issingle` shape of
 		# get_link_fields). The kid rows carry case-variant, misspelled and NULL parents, so this also checks the

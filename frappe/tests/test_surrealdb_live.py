@@ -106,7 +106,9 @@ class TestSurrealDBLive(LiveSurrealDB, UnitTestCase):
 		db_name, db_user, password = self.new_site()
 		with (
 			self._site_conf(db_name, db_user, password),
-			patch.dict(frappe.flags, {"root_password": "wrong"}),
+			# the root credentials reach setup_db through the conf keys - get_root_connection overrides the
+			# flags with them (bench passes MariaDB-style credentials as flags), so patch the conf, not the flags
+			patch.dict(frappe.local.conf, {"surrealdb_root_password": "wrong"}),
 		):
 			with self.assertRaises(E.SurrealDBAuthError):
 				setup_db.setup_database(force=False, verbose=False)

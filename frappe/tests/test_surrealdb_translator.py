@@ -18,6 +18,7 @@ from frappe.database.surrealdb.translator import render
 from frappe.query_builder import functions as qf
 from frappe.query_builder.surrealdb_builder import SurrealDB
 from frappe.tests import UnitTestCase
+from frappe.query_builder.terms import ParameterizedValueWrapper, SubQuery
 
 T = Table("tabDoc")
 
@@ -35,8 +36,32 @@ def make_schema(table="tabDoc"):
 	if table == "tabDocType":
 		specs = [
 			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Data", "module", set_index=1),
 			col("Check", "issingle"),
 			col("Int", "is_virtual"),
+		]
+	elif table == "tabReport":
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Data", "ref_doctype", set_index=1),
+		]
+	elif table == "tabNote":
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Data", "title", set_index=1),
+			col("Text", "content"),
+			col("Int", "notify_on_login", not_nullable=1),
+			col("Datetime", "expire_notification_on"),
+			col("Check", "notify_on_every_login"),
+		]
+	elif table == "tabNote Seen By":
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			col("Data", "parent", set_index=1),
+			col("Data", "parenttype"),
+			col("Data", "parentfield"),
+			col("Data", "user", set_index=1),
+			col("Int", "idx"),
 		]
 	elif table == "tabCustom Field":
 		specs = [
@@ -65,7 +90,7 @@ def make_schema(table="tabDoc"):
 
 
 def loader(name):
-	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field"):
+	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field", "tabReport", "tabNote", "tabNote Seen By"):
 		raise SurrealDBProgrammingError(1146, f"Table '{name}' doesn't exist")
 	return make_schema(name)
 
@@ -798,6 +823,70 @@ class TestSurrealDBTranslator(UnitTestCase):
 		)
 		self.assertIn("(array::map([{`k1`: `qty`}], |$o| ($param1 IN (SELECT VALUE `__c0` FROM", sql)
 		self.assertEqual(params.values, {"param1": 3})
+
+	def test_correlated_not_in_and_frappe_subquery_wrapper(self):
+		# P1.14: `notin` (pypika negates into `Not(ContainsCriterion)`) and frappe's own `SubQuery` wrapper
+		# (note.py's unseen-notes login check and listview.py's ToDo filter wrap the builder in it) both fell
+		# through the dispatcher into "IN over a SubQuery is not implemented"; both unwrap to the P1.13
+		# correlated-IN machinery now.
+		dt = Table("tabDocType")
+		linked = SurrealDB.from_(dt).select(dt.issingle).where(dt.is_virtual == T.qty)
+		bare, _ = r(q().select(T.name).where(T.qty.notin(linked)))
+		self.assertIn("(array::map([{`k1`: `qty`, `k2`: `qty`}], |$o| (array::len(", bare)
+		self.assertIn("NOT ($o.`k2` IN (SELECT VALUE `__c0` FROM", bare)
+		self.assertIn("AND NOT (NULL IN (SELECT VALUE `__c0` FROM", bare)
+		self.assertIn("AND NOT (NONE IN (SELECT VALUE `__c0` FROM", bare)
+		# the same query through frappe's SubQuery wrapper renders identically
+		wrapped, _ = r(q().select(T.name).where(T.qty.notin(SubQuery(linked))))
+		self.assertEqual(bare, wrapped)
+		# the uncorrelated form hoists once (listview.py's ToDo filter shape)
+		uncorr, _ = r(q().select(T.name).where(T.title.isin(SubQuery(SurrealDB.from_(dt).select(dt.name)))))
+		self.assertIn("LET $sq1 = (SELECT VALUE `__c0` FROM (SELECT `name@ci` AS `__c0` FROM `tabDocType`))", uncorr)
+		self.assertIn("`title@ci` IN $sq1", uncorr)
+
+	def test_note_seen_by_login_query(self):
+		# note.py `_get_unseen_notes` runs on EVERY login (the on_login trigger): a parameterized needle
+		# NOT IN a correlated child-table sub-query, wrapped in frappe's SubQuery, over an aliased child
+		# table. P1.14: renders per outer row via the correlated-IN closure, the needle bound once.
+		note = Table("tabNote")
+		nsb = Table("tabNote Seen By").as_("nsb")
+		sql, params = render(
+			SurrealDB.from_(note)
+			.select(note.name, note.title, note.content, note.notify_on_every_login)
+			.where(
+				(note.notify_on_login == 1)
+				& (note.expire_notification_on > "2026-09-22 10:00:00")
+				& (
+					ParameterizedValueWrapper("user@example.com").notin(
+						SubQuery(SurrealDB.from_(nsb).select(nsb.user).where(nsb.parent == note.name))
+					)
+				)
+			),
+			None,
+			loader,
+		)
+		self.assertIn("array::map([{", sql)
+		self.assertIn("`parent@ci` = $o.", sql)  # the closure binds the outer note name
+		self.assertIn("array::len((SELECT VALUE `__c0` FROM (SELECT `user@ci` AS `__c0` "
+			"FROM `tabNote Seen By` WHERE", sql.replace("`nsb`", "`tabNote Seen By`").replace("`tabNote Seen By` `nsb`", "`tabNote Seen By`"))  # fmt: skip
+		self.assertIn("NOT (NULL IN", sql)
+		self.assertIn("NOT (NONE IN", sql)
+
+	def test_translate_messages_comma_join(self):
+		# translate.py `get_messages_for_app`: a legacy 2-table comma join with an IN-list conjunct on the
+		# first table. P1.13's comma-join machinery covers it; the golden pins the framework shape.
+		dt, rp = Table("tabDocType"), Table("tabReport")
+		sql, params = r(
+			SurrealDB.from_(dt)
+			.from_(rp)
+			.where((rp.ref_doctype == dt.name) & dt.module.isin(["Core", "Email"]))
+			.select(rp.name)
+		)
+		self.assertIn("(SELECT VALUE { `t0`: $this } FROM `tabDocType` WHERE (`module@ci` IN [$param1, $param2]))", sql)
+		self.assertIn(
+			"(SELECT VALUE { `t0`: $r.`t0`, `t1`: $this } FROM `tabReport` WHERE (`ref_doctype@ci` != NULL", sql
+		)
+		self.assertEqual(params.values, {"param1": C.ci_key("Core"), "param2": C.ci_key("Email")})
 
 	def test_varchar_column_meets_an_int_like_mariadb(self):
 		# patch_text_int_cmp (P2.1, official-run blocker #3): the Property Setter's `value = 1` shape
