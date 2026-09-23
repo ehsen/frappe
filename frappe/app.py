@@ -353,11 +353,17 @@ def handle_exception(e):
 	response = None
 	http_status_code = getattr(e, "http_status_code", 500)
 	accept_header = frappe.get_request_header("Accept") or ""
+	db = getattr(frappe.local, "db", None)  # unbound when init failed early; LocalProxy access would raise
+	# `init_request` can fail before it set `local.is_ajax` / `local.session`; accessing them
+	# here used to raise AttributeError and mask the original exception (and left frappe.log empty).
 	respond_as_json = (
-		frappe.get_request_header("Accept") and (frappe.local.is_ajax or "application/json" in accept_header)
+		frappe.get_request_header("Accept")
+		and (getattr(frappe.local, "is_ajax", False) or "application/json" in accept_header)
 	) or (frappe.local.request.path.startswith("/api/") and not accept_header.startswith("text"))
 
-	if not frappe.session.user:
+	if not getattr(frappe.local, "session", None):
+		frappe.local.session = _dict(user="Guest")
+	elif not frappe.session.user:
 		# If session creation fails then user won't be unset. This causes a lot of code that
 		# assumes presence of this to fail. Session creation fails => guest or expired login
 		# usually.
@@ -373,8 +379,8 @@ def handle_exception(e):
 
 	elif (
 		http_status_code == 500
-		and (frappe.db and isinstance(e, frappe.db.InternalError))
-		and (frappe.db and (frappe.db.is_deadlocked(e) or frappe.db.is_timedout(e)))
+		and (db and isinstance(e, db.InternalError))
+		and (db and (db.is_deadlocked(e) or db.is_timedout(e)))
 	):
 		http_status_code = 508
 
