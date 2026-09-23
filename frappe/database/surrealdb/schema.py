@@ -26,7 +26,7 @@ from decimal import Decimal
 import frappe
 from frappe import _
 from frappe.database.schema import NOT_NULL_TYPES, DbColumn, DBTable, get_definition, validate_column_name
-from frappe.database.surrealdb import collation, values
+from frappe.database.surrealdb import collation, text_shadows, values
 from frappe.database.surrealdb.errors import SurrealDBProgrammingError
 from frappe.utils import cint, cstr, flt
 from frappe.utils.defaults import get_not_null_defaults
@@ -135,6 +135,18 @@ def unescape(inner: str) -> str:
 
 
 # --- column specification ------------------------------------------------------------------------------------------
+# Invariant (P1.15, see frappe/database/surrealdb/text_shadows.py):
+# A text_collation_shadow column remains physically and semantically a Text column EXCEPT for
+# string-collation operations. Its @ci and @like fields provide the MariaDB-compatible equivalence
+# relation used by =, !=, IN, NOT IN, emptiness, LIKE, ORDER BY and GROUP BY. All of these operations
+# MUST use the same collation representation. Mixing @ci with inline string::lowercase() on one
+# column is forbidden.
+# text_collation_shadow MUST NOT imply: varchar length limits (assertion() stays is_varchar-only);
+# varchar DDL type / meta["t"] (kind is never mutated); index eligibility (index_field() stays
+# is_varchar-only). Source, @ci, @like and @hash are written together by
+# text_shadows.build_collation_shadows() in one statement; the engine rejects any write where
+# @hash != sha256(source). If shadow integrity is not established, queries on the column RAISE —
+# they never fall back to the inline lowercase path.
 @dataclass
 class ColumnSpec:
 	name: str
@@ -145,6 +157,7 @@ class ColumnSpec:
 	index: bool = False
 	custom_assert: str | None = None
 	order: int | None = None  # position in the table definition (SELECT * returns columns in this order)
+	text_collation_shadow: bool = False  # set only by specs()/table_schema_from_info() from the registry
 	kind: str = field(init=False)
 	arg: tuple = field(init=False)
 
@@ -153,6 +166,10 @@ class ColumnSpec:
 		base = m[1] if m else self.logical
 		self.arg = tuple(int(x) for x in (m[2] or "").split(",") if x) if m else ()
 		self.kind = {"longtext": "text", "text": "text", "json": "json", "mediumtext": "text"}.get(base, base)
+		if self.text_collation_shadow and self.kind not in ("text", "json"):
+			raise SurrealDBProgrammingError(
+				0, f"text_collation_shadow is only legal on text/json columns ({self.name!r} is {self.kind!r})"
+			)
 
 	@property
 	def is_varchar(self) -> bool:
@@ -161,6 +178,24 @@ class ColumnSpec:
 	@property
 	def is_text(self) -> bool:
 		return self.kind in ("text", "json")
+
+	@property
+	def has_collation_shadow(self) -> bool:
+		"""Column carries @ci/@like and supports exact MariaDB string collation."""
+		return self.is_varchar or self.text_collation_shadow
+
+	@property
+	def has_integrity_hash(self) -> bool:
+		"""Column carries an engine-enforced @hash witness (P1.15: text shadows only)."""
+		return self.text_collation_shadow
+
+	@property
+	def is_length_limited_string(self) -> bool:
+		return self.is_varchar
+
+	@property
+	def shadow_index_eligible(self) -> bool:
+		return self.is_varchar
 
 	@property
 	def surreal_type(self) -> str:
@@ -384,6 +419,8 @@ class SurrealDBTable(DBTable):
 			if fieldname in std:
 				continue
 			if (spec := column_spec_from_docfield(col)) is not None:
+				if spec.is_text and text_shadows.is_shadowed(self.table_name, fieldname):
+					spec.text_collation_shadow = True
 				out.append(spec)
 		return out
 

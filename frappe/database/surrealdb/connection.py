@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from frappe.database.surrealdb import text_shadows
 from frappe.database.surrealdb.errors import (
 	CR_SERVER_GONE,
 	ER_ACCESS_DENIED,
@@ -368,6 +369,7 @@ class SurrealConnection:
 		self._txn = None
 		self._lost = False
 		self._reset_unit()
+		text_shadows.freeze()  # the allow-list is closed once a driver connection exists (P1.15)
 		return self
 
 	def select_db(self, database: str):
