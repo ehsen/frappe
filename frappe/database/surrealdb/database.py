@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 import frappe
 from frappe.database.database import Database
-from frappe.database.surrealdb import collation, text_shadows
+from frappe.database.surrealdb import collation, legacy_sql, text_shadows
 from frappe.database.surrealdb.connection import (
 	DEFAULT_NAMESPACE,
 	ConnectionParams,
@@ -259,6 +259,12 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 		# reads) which reset `self._require_order` and the cursor flag; the flag captured below reflects
 		# THIS call's consumer and is applied to the cursor after the recursion.
 		require_order = getattr(self, "_require_order", True)
+		# the legacy interpolated text path (DatabaseQuery / plain db.sql text, chunk P1.6e): rewrite
+		# the MariaDB constructs SurrealQL has no meaning for; pass anything unknown through verbatim
+		if values is None and isinstance(query, str) and "/*" not in query:
+			legacy = legacy_sql.rewrite(query, self)
+			if legacy is not None:
+				query, values = legacy
 		query = self._order_by_projection(query)
 		query = self._columns_hint_for_star(query, values, require_order)
 		self._cursor.require_order = require_order
@@ -354,6 +360,9 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 	def sql_ddl(self, query, debug=False):
 		"""Commit, run a DDL statement, commit again. MariaDB DDL autocommits; here it must too, because SurrealDB
 		features outside the transaction (sequences) and other connections only see committed definitions."""
+		legacy = legacy_sql.rewrite_ddl(query)
+		if legacy is not None:  # `drop table [if exists]`: the compat layer has no MariaDB DDL text (P1.6e)
+			query = legacy
 		transaction_control = self._disable_transaction_control
 		self._disable_transaction_control = 0
 		try:

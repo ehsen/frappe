@@ -13,6 +13,7 @@ from pypika.terms import Tuple, ValueWrapper
 import frappe
 from frappe.database.schema import DbColumn
 from frappe.database.surrealdb import collation as C
+from frappe.database.surrealdb import legacy_sql
 from frappe.database.surrealdb import schema as S
 from frappe.database.surrealdb.errors import SurrealDBNotImplementedError, SurrealDBProgrammingError
 from frappe.database.surrealdb.translator import render
@@ -163,7 +164,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 
 	def test_shadowed_text_column_like_order_group(self):
 		K = Table("tabParityKid")
-		sql, params = r(SurrealDB.from_(K).select(K.name).where(K.text_sh.like("%traße%")))
+		sql, _ = r(SurrealDB.from_(K).select(K.name).where(K.text_sh.like("%traße%")))
 		self.assertIn("string::matches(`text_sh@like`, $param1)", sql)
 		sql, _ = r(SurrealDB.from_(K).select(K.name).orderby(K.text_sh))
 		self.assertIn("`text_sh@ci` AS `__o0`", sql)
@@ -176,7 +177,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 
 	def test_shadowed_text_ifnull_and_coalesce(self):
 		K = Table("tabParityKid")
-		sql, params = r(SurrealDB.from_(K).select(K.name).where(fn.IfNull(K.text_sh, "") == ""))
+		sql, _ = r(SurrealDB.from_(K).select(K.name).where(fn.IfNull(K.text_sh, "") == ""))
 		self.assertIn("`text_sh@ci`", sql)
 		sql, _ = r(SurrealDB.from_(K).select(K.name).where(fn.Coalesce(K.text_sh, "x") == "y"))
 		self.assertIn("`text_sh@ci`", sql)
@@ -931,7 +932,7 @@ class TestSurrealDBTranslator(UnitTestCase):
 		# table. P1.14: renders per outer row via the correlated-IN closure, the needle bound once.
 		note = Table("tabNote")
 		nsb = Table("tabNote Seen By").as_("nsb")
-		sql, params = render(
+		sql, _ = render(
 			SurrealDB.from_(note)
 			.select(note.name, note.title, note.content, note.notify_on_every_login)
 			.where(
@@ -1062,3 +1063,105 @@ class TestFragmentParser(UnitTestCase):
 		with self.assertRaises((SurrealDBNotImplementedError, SurrealDBProgrammingError)) as cm:
 			r(SurrealDB.from_(T).select(T.name).where(RawCriterion("`tabOther`.title = 'x'")))
 		self.assertIn("not in the FROM/JOIN list", str(cm.exception))
+
+
+class TestLegacySql(UnitTestCase):
+	"""Chunk P1.6e: the legacy interpolated-SELECT rewriter (DatabaseQuery / raw db.sql text).
+	Every predicate leaf renders through the P1.6d fragment machinery; constructs the rewriter
+	does not know pass through verbatim (the server keeps its own verdict)."""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		if frappe.db.db_type != "mariadb":
+			raise unittest.SkipTest("uses the MariaDB site only for frappe.db.type_map in column specs")
+
+	def lr(self, query):
+		out = legacy_sql.rewrite(query, None, loader)
+		self.assertIsNotNone(out, f"not rewritten: {query}")
+		return out
+
+	def test_order_by_qualifier_is_dropped(self):
+		self.assertEqual(
+			self.lr("select `tabDoc`.`name`\nfrom `tabDoc`\n\n order by `tabDoc`.`creation` DESC ")[0],
+			"SELECT `name` FROM `tabDoc` ORDER BY `creation` DESC",
+		)
+
+	def test_like_goes_through_the_like_shadow(self):
+		sql, params = self.lr("select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`name` like 'J%%'")
+		self.assertEqual(
+			sql,
+			"SELECT `name` FROM `tabDoc` WHERE (`name@like` != NULL AND `name@like` != NONE AND string::matches(`name@like`, $param1))",
+		)
+		# the legacy text keeps MariaDB's doubled `%` (the escape) - the same match set, one more wildcard
+		self.assertEqual(params, {"param1": C.like_regex("J%%", "\\")})
+
+	def test_in_uses_the_collation_shadow_for_varchar_and_bare_values_for_int(self):
+		sql, params = self.lr("select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`title` in ('A', 'B')")
+		self.assertIn("(`title@ci` IN [$param1, $param2])", sql)
+		self.assertEqual(params, {"param1": C.ci_key("A"), "param2": C.ci_key("B")})
+		sql, params = self.lr("select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`qty` in (1, 2)")
+		self.assertIn("(`qty` IN [$param1, $param2])", sql)
+		self.assertEqual(params, {"param1": 1, "param2": 2})
+
+	def test_not_in(self):
+		sql, _ = self.lr("select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`qty` not in (1, 2)")
+		self.assertIn("(`qty` != NULL AND `qty` != NONE AND NOT (`qty` IN [$param1, $param2]))", sql)
+
+	def test_between_keeps_its_own_and(self):
+		sql, params = self.lr(
+			"select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`qty` between 1 and 5 and `tabDoc`.`flag` = 1"
+		)
+		self.assertIn("(`qty` != NULL AND `qty` != NONE AND `qty` >= $param1 AND `qty` <= $param2)", sql)
+		self.assertIn("AND (`flag` = $param3)", sql)
+		self.assertEqual(params["param3"], 1)
+
+	def test_is_set_composite(self):
+		sql, _ = self.lr(
+			"select `tabDoc`.`name` from `tabDoc` where ( `tabDoc`.`title` is NULL OR `tabDoc`.`title` = '' )"
+		)
+		self.assertEqual(sql, "SELECT `name` FROM `tabDoc` WHERE ((`title` = NULL OR `title` = NONE) OR (`title@ci` = $param1))")
+
+	def test_limit_forms(self):
+		self.assertIn("LIMIT 3 START 1", self.lr("select `tabDoc`.`name` from `tabDoc` limit 3 offset 1")[0])
+		self.assertIn("LIMIT 10 START 5", self.lr("select `tabDoc`.`name` from `tabDoc` limit 5, 10")[0])
+		self.assertIn("LIMIT 7", self.lr("select `tabDoc`.`name` from `tabDoc` limit 7")[0])
+
+	def test_count_star_and_count_column(self):
+		self.assertEqual(
+			self.lr("select count(*) from `tabDoc`")[0],
+			"SELECT count() FROM `tabDoc` GROUP ALL",
+		)
+		sql, _ = self.lr("select count(`name`) as count from `tabDoc`")
+		self.assertEqual(sql, "SELECT count((`name` != NULL AND `name` != NONE)) AS `count` FROM `tabDoc` GROUP ALL")
+
+	def test_distinct_becomes_group_by(self):
+		sql, _ = self.lr("select distinct `tabDoc`.`title` from `tabDoc`")
+		self.assertEqual(sql, "SELECT `title` FROM `tabDoc` GROUP BY `title`")
+
+	def test_drop_table_if_exists_becomes_remove(self):
+		self.assertEqual(
+			legacy_sql.rewrite_ddl("drop table if exists `tabTest Tree DocType`"),
+			"REMOVE TABLE IF EXISTS `tabTest Tree DocType`",
+		)
+
+	def test_unknown_column_keeps_mariadb_1054(self):
+		with self.assertRaises(SurrealDBProgrammingError) as cm:
+			legacy_sql.rewrite("select `tabDoc`.`missing` from `tabDoc`", None, loader)
+		self.assertEqual(cm.exception.args[0], 1054)
+		with self.assertRaises(SurrealDBProgrammingError) as cm2:
+			legacy_sql.rewrite("select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`missing` = 1", None, loader)
+		self.assertEqual(cm2.exception.args[0], 1054)
+
+	def test_unknown_constructs_pass_through_untouched(self):
+		for query in (
+			"select `tabDoc`.`name` from `tabDoc` where `tabDoc`.`name` = %s",
+			"select `tabDoc`.`name` from `tabDoc` join `tabNote` on `tabNote`.`parent` = `tabDoc`.`name`",
+			"select `tabDoc`.`name` from `tabDoc` where exists (select 'x' from `tabNote` n where n.parent = `tabDoc`.`name`)",
+			"select `tabDoc`.`name` from `tabDoc` where coalesce(`tabDoc`.`title`, '') = ''",
+			"select `tabDoc`.`title`, count(*) from `tabDoc` group by `tabDoc`.`title`",
+		):
+			self.assertIsNone(legacy_sql.rewrite(query, None, loader), query)
+
+	def test_unknown_table_passes_through_for_the_server_1146(self):
+		self.assertIsNone(legacy_sql.rewrite("select `tabNope`.`name` from `tabNope`", None, loader))
