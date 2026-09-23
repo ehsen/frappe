@@ -363,6 +363,9 @@ class SurrealDBDatabase(SurrealDBExceptionUtil, Database):
 			self.begin()
 		finally:
 			self._disable_transaction_control = transaction_control
+		# a DDL can change the structure any later statement sees - keep the schema and table-list
+		# caches consistent like MariaDB's live information_schema (P1.9b)
+		self.clear_db_table_cache(query.split(None, 1)[0].strip("`\"'").lower())
 
 	def check_implicit_commit(self, query: str, query_type: str):
 		"""MariaDB commits implicitly on DDL, which Frappe guards against once a transaction has written. In SurrealDB

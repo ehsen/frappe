@@ -14,6 +14,22 @@ COLUMNS = [
 def execute(filters=None):
 	frappe.only_for("System Manager")
 
+	if frappe.db.db_type == "surrealdb":
+		# SurrealDB exposes no storage metadata: estimate from the driver's logical
+		# column sizing (MariaDB's sizing rules) per row; index size is unavailable (P1.9b)
+		data = []
+		for table in frappe.db.get_tables():
+			doctype = table.removeprefix("tab")
+			try:
+				# on-demand tables (e.g. the lock tables) can vanish between
+				# get_tables() and the count - skip them
+				size = round(frappe.db.get_row_size(doctype) * frappe.db.count(doctype) / 1024 / 1024, 2)
+			except Exception:
+				continue
+			data.append(frappe._dict(table=table, size=size, data_size=size, index_size=0.0))
+		data.sort(key=lambda row: row["size"], reverse=True)
+		return COLUMNS, data
+
 	data = frappe.db.multisql(
 		{
 			"mariadb": """
@@ -80,6 +96,9 @@ def optimize_doctype_job(doctype_name: str):
 	doctype_table = get_table_name(doctype_name, wrap_in_backticks=True)
 	if frappe.db.db_type == "mariadb":
 		query = f"OPTIMIZE TABLE {doctype_table};"
+	elif frappe.db.db_type == "surrealdb":
+		# SurrealDB needs no engine-level maintenance for this (P1.9b)
+		return
 	else:
 		query = f"VACUUM (ANALYZE) {doctype_table};"
 

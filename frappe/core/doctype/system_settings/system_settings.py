@@ -231,14 +231,10 @@ class SystemSettings(Document):
 
 
 def update_last_reset_password_date():
-	frappe.db.sql(
-		""" UPDATE `tabUser`
-		SET
-			last_password_reset_date = %s
-		WHERE
-			last_password_reset_date is null""",
-		today(),
-	)
+	_user = frappe.qb.DocType("User")
+	frappe.qb.update(_user).set("last_password_reset_date", today()).where(
+		_user.last_password_reset_date.isnull()
+	).run()
 
 
 @frappe.whitelist()

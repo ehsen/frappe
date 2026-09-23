@@ -241,51 +241,83 @@ def _fetch_table_stats(doctype: str, columns: list[str]) -> dict | None:
 	def sql_bool(val):
 		return cstr(val).lower() in ("yes", "1", "true")
 
-	if not frappe.db.table_exists(doctype):
-		return
-
-	table = get_table_name(doctype, wrap_in_backticks=True)
-
-	schema = []
-	for field in frappe.db.sql(f"describe {table}", as_dict=True):
-		schema.append(
-			{
-				"column": field["Field"],
-				"type": field["Type"],
-				"is_nullable": sql_bool(field["Null"]),
-				"default": field["Default"],
-			}
-		)
-
 	def update_cardinality(column, value):
 		for col in schema:
 			if col["column"] == column:
 				col["cardinality"] = value
 				break
 
-	indexes = []
-	for idx in frappe.db.sql(f"show index from {table}", as_dict=True):
-		indexes.append(
-			{
-				"unique": not sql_bool(idx["Non_unique"]),
-				"cardinality": idx["Cardinality"],
-				"name": idx["Key_name"],
-				"sequence": idx["Seq_in_index"],
-				"nullable": sql_bool(idx["Null"]),
-				"column": idx["Column_name"],
-				"type": idx["Index_type"],
-			}
-		)
-		if idx["Seq_in_index"] == 1:
-			update_cardinality(idx["Column_name"], idx["Cardinality"])
+	if not frappe.db.table_exists(doctype):
+		return
 
-	total_rows = cint(
-		frappe.db.sql(
-			f"""select table_rows
-			   from  information_schema.tables
-			   where table_name = 'tab{doctype}'"""
-		)[0][0]
-	)
+	table = get_table_name(doctype, wrap_in_backticks=True)
+
+	schema = []
+	indexes = []
+
+	if frappe.db.db_type == "surrealdb":
+		# INFO FOR TABLE via the driver - no DESCRIBE / SHOW INDEX / information_schema
+		# on SurrealDB; SurrealDB exposes no cardinality estimates (P1.9b)
+		info = frappe.db.table_info(get_table_name(doctype))
+		for field in frappe.db.get_table_columns_description(get_table_name(doctype)):
+			schema.append(
+				{
+					"column": field["name"],
+					"type": field["type"],
+					"is_nullable": not field["not_nullable"],
+					"default": field["default"],
+				}
+			)
+		for ix in info.indexes.values():
+			for sequence, column in enumerate(ix["fields"], 1):
+				indexes.append(
+					{
+						"unique": bool(ix["unique"]),
+						"cardinality": None,
+						"name": ix["name"],
+						"sequence": sequence,
+						"nullable": None,
+						"column": column,
+						"type": ix.get("kind", "index"),
+					}
+				)
+				if sequence == 1:
+					update_cardinality(column, None)
+
+		total_rows = cint(frappe.db.count(doctype))
+	else:
+		for field in frappe.db.sql(f"describe {table}", as_dict=True):
+			schema.append(
+				{
+					"column": field["Field"],
+					"type": field["Type"],
+					"is_nullable": sql_bool(field["Null"]),
+					"default": field["Default"],
+				}
+			)
+
+		for idx in frappe.db.sql(f"show index from {table}", as_dict=True):
+			indexes.append(
+				{
+					"unique": not sql_bool(idx["Non_unique"]),
+					"cardinality": idx["Cardinality"],
+					"name": idx["Key_name"],
+					"sequence": idx["Seq_in_index"],
+					"nullable": sql_bool(idx["Null"]),
+					"column": idx["Column_name"],
+					"type": idx["Index_type"],
+				}
+			)
+			if idx["Seq_in_index"] == 1:
+				update_cardinality(idx["Column_name"], idx["Cardinality"])
+
+		total_rows = cint(
+			frappe.db.sql(
+				f"""select table_rows
+				   from  information_schema.tables
+				   where table_name = 'tab{doctype}'"""
+			)[0][0]
+		)
 
 	# fetch accurate cardinality for columns by query. WARN: This can take A LOT of time.
 	for column in columns:
@@ -302,6 +334,9 @@ def _fetch_table_stats(doctype: str, columns: list[str]) -> dict | None:
 
 @redis_cache
 def _get_column_cardinality(table, column):
+	if frappe.db.db_type == "surrealdb":
+		# COUNT(DISTINCT col) fails closed on SurrealDB: same value via a scan + set (P1.9b)
+		return len({row[0] for row in frappe.db.sql(f"select {column} from {table}")})
 	return frappe.db.sql(f"select count(distinct {column}) from {table}")[0][0]
 
 

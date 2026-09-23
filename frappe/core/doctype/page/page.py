@@ -4,6 +4,8 @@
 import os
 import shutil
 
+from pypika import Order
+
 import frappe
 from frappe import _, conf, get_module_path, safe_decode
 from frappe.build import html_to_js_template
@@ -45,9 +47,14 @@ class Page(Document):
 		if (self.name and self.name.startswith("New Page")) or not self.name:
 			self.name = self.page_name.lower().replace('"', "").replace("'", "").replace(" ", "-")[:20]
 			if frappe.db.exists("Page", self.name):
-				cnt = frappe.db.sql(
-					"""select name from tabPage
-					where name like "{}-%" order by name desc limit 1""".format(self.name)
+				_page = frappe.qb.DocType("Page")
+				cnt = (
+					frappe.qb.from_(_page)
+					.select(_page.name)
+					.where(_page.name.like(f"{self.name}-%"))
+					.orderby(_page.name, order=Order.desc)
+					.limit(1)
+					.run()
 				)
 				if cnt:
 					cnt = cint(cnt[0][0].split("-")[-1]) + 1

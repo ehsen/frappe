@@ -117,22 +117,21 @@ class Domain(Document):
 
 	def setup_sidebar_items(self):
 		"""Enable / disable sidebar items"""
+		portal_menu_item = frappe.qb.DocType("Portal Menu Item")
 		if self.data.allow_sidebar_items:
 			# disable all
-			frappe.db.sql("update `tabPortal Menu Item` set enabled=0")
+			frappe.qb.update(portal_menu_item).set("enabled", 0).run()
 
 			# enable
-			frappe.db.sql(
-				"""update `tabPortal Menu Item` set enabled=1
-				where route in ({})""".format(", ".join(f'"{d}"' for d in self.data.allow_sidebar_items))
-			)
+			frappe.qb.update(portal_menu_item).set("enabled", 1).where(
+				portal_menu_item.route.isin(self.data.allow_sidebar_items)
+			).run()
 
 		if self.data.remove_sidebar_items:
 			# disable all
-			frappe.db.sql("update `tabPortal Menu Item` set enabled=1")
+			frappe.qb.update(portal_menu_item).set("enabled", 1).run()
 
 			# enable
-			frappe.db.sql(
-				"""update `tabPortal Menu Item` set enabled=0
-				where route in ({})""".format(", ".join(f'"{d}"' for d in self.data.remove_sidebar_items))
-			)
+			frappe.qb.update(portal_menu_item).set("enabled", 0).where(
+				portal_menu_item.route.isin(self.data.remove_sidebar_items)
+			).run()

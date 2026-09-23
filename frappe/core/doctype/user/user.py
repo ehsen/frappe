@@ -20,10 +20,12 @@ from frappe.desk.doctype.notification_settings.notification_settings import (
 )
 from frappe.desk.notifications import clear_notifications
 from frappe.model.document import Document
-from frappe.query_builder import DocType
+from frappe.query_builder import DocType, Table
+from frappe.query_builder.functions import Sum
 from frappe.rate_limiter import rate_limit
 from frappe.sessions import clear_sessions
 from frappe.utils import (
+	add_to_date,
 	cint,
 	escape_html,
 	flt,
@@ -678,12 +680,8 @@ class User(Document):
 			desc = frappe.db.get_table_columns_description(tab)
 			has_fields = [d.get("name") for d in desc if d.get("name") in ["owner", "modified_by"]]
 			for field in has_fields:
-				frappe.db.sql(
-					"""UPDATE `{}`
-					SET `{}` = {}
-					WHERE `{}` = {}""".format(tab, field, "%s", field, "%s"),
-					(new_name, old_name),
-				)
+				_table = frappe.qb.Table(tab)
+				frappe.qb.update(_table).set(field, new_name).where(_table[field] == old_name).run()
 
 		if frappe.db.exists("Notification Settings", old_name):
 			frappe.rename_doc("Notification Settings", old_name, new_name, force=True, show_alert=False)
@@ -1210,15 +1208,12 @@ def user_query(doctype: str, txt: str, searchfield: str, start: int, page_len: i
 
 def get_total_users():
 	"""Return total number of system users."""
+	_user = frappe.qb.DocType("User")
 	return flt(
-		frappe.db.sql(
-			"""SELECT SUM(`simultaneous_sessions`)
-		FROM `tabUser`
-		WHERE `enabled` = 1
-		AND `user_type` = 'System User'
-		AND `name` NOT IN ({})""".format(", ".join(["%s"] * len(STANDARD_USERS))),
-			STANDARD_USERS,
-		)[0][0]
+		frappe.qb.from_(_user)
+		.select(Sum(_user.simultaneous_sessions))
+		.where((_user.enabled == 1) & (_user.user_type == "System User") & _user.name.notin(STANDARD_USERS))
+		.run()[0][0]
 	)
 
 
@@ -1243,6 +1238,20 @@ def get_system_users(exclude_users: Iterable[str] | str | None = None, limit: in
 
 def get_active_users():
 	"""Return number of system users who logged in, in the last 3 days."""
+	if frappe.db.db_type == "surrealdb":
+		# HOUR(TIMEDIFF(now(), last_active)) < 72 == last_active >= now() - 72h
+		# (MariaDB's HOUR caps at 838 for gaps beyond ~34 days, which only widens the
+		# inequality in the same direction - P1.9b)
+		cutoff = add_to_date(now_datetime(), hours=-72)
+		return frappe.db.count(
+			"User",
+			filters={
+				"enabled": 1,
+				"user_type": ("!=", "Website User"),
+				"name": ("not in", STANDARD_USERS),
+				"last_active": (">=", cutoff),
+			},
+		)
 	return frappe.db.sql(
 		"""select count(*) from `tabUser`
 		where enabled = 1 and user_type != 'Website User'
@@ -1259,6 +1268,17 @@ def get_website_users():
 
 def get_active_website_users():
 	"""Return number of website users who logged in, in the last 3 days."""
+	if frappe.db.db_type == "surrealdb":
+		# see get_active_users: HOUR(TIMEDIFF()) == last_active >= now() - 72h (P1.9b)
+		cutoff = add_to_date(now_datetime(), hours=-72)
+		return frappe.db.count(
+			"User",
+			filters={
+				"enabled": 1,
+				"user_type": "Website User",
+				"last_active": (">=", cutoff),
+			},
+		)
 	return frappe.db.sql(
 		"""select count(*) from `tabUser`
         where enabled = 1 and user_type = 'Website User'

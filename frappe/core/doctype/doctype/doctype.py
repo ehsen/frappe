@@ -33,7 +33,7 @@ from frappe.modules import get_doc_path, make_boilerplate
 from frappe.modules.import_file import get_file_path
 from frappe.permissions import ALL_USER_ROLE, AUTOMATIC_ROLES, SYSTEM_USER_ROLE
 from frappe.query_builder import DocType as QBTable
-from frappe.query_builder.functions import Concat, Count
+from frappe.query_builder.functions import Concat, Count, Max
 from frappe.utils import cint, cstr, flt, get_datetime, is_a_property, random_string
 from frappe.website.utils import clear_cache
 
@@ -376,6 +376,40 @@ class DocType(Document):
 						else:
 							update_query += "WHERE ifnull(`target`.`{fieldname}`, '')=''"
 
+					elif frappe.db.db_type == "surrealdb":
+						# SurrealDB has no UPDATE ... JOIN/FROM: backfill the fetched values with a
+						# read-then-update sweep (runs here because the flags queue carries engine
+						# SQL for MariaDB/PG only - P1.9b)
+						_target = QBTable(self.name)
+						empty_filter = (
+							_target[df.fieldname] == ""
+							if df.not_nullable
+							else (_target[df.fieldname] == "") | _target[df.fieldname].isnull()
+						)
+						target_rows = (
+							frappe.qb.from_(_target)
+							.select(_target.name, _target[link_fieldname])
+							.where(empty_filter)
+							.run(as_dict=True)
+						)
+						link_names = list({row[link_fieldname] for row in target_rows if row[link_fieldname]})
+						_link = QBTable(link_df.options)
+						source_values = {}
+						for chunk in (link_names[i : i + 500] for i in range(0, len(link_names), 500)):
+							for row in (
+								frappe.qb.from_(_link)
+								.select(_link.name, _link[source_fieldname])
+								.where(_link.name.isin(chunk))
+								.run(as_dict=True)
+							):
+								source_values[row["name"]] = row[source_fieldname]
+						for row in target_rows:
+							if row[link_fieldname] not in source_values:
+								continue
+								frappe.qb.update(_target).set(
+									df.fieldname, source_values[row[link_fieldname]]
+								).where(_target.name == row["name"]).run()
+
 					else:
 						update_query = """
 							UPDATE `tab{doctype}`
@@ -677,12 +711,11 @@ class DocType(Document):
 		`doctype` property for Single type."""
 
 		if self.issingle:
-			frappe.db.sql("""update tabSingles set doctype=%s where doctype=%s""", (new, old))
-			frappe.db.sql(
-				"""update tabSingles set value=%s
-				where doctype=%s and field='name' and value = %s""",
-				(new, new, old),
-			)
+			_singles = QBTable("Singles")
+			frappe.qb.update(_singles).set("doctype", new).where(_singles.doctype == old).run()
+			frappe.qb.update(_singles).set("value", new).where(
+				(_singles.doctype == new) & (_singles.field == "name") & (_singles.value == old)
+			).run()
 		elif not self.is_virtual:
 			frappe.db.rename_table(old, new)
 			frappe.db.commit()
@@ -1051,7 +1084,10 @@ class DocType(Document):
 
 	def get_max_idx(self):
 		"""Return the highest `idx`."""
-		max_idx = frappe.db.sql("""select max(idx) from `tabDocField` where parent = %s""", self.name)
+		docfield = QBTable("DocField")
+		max_idx = (
+			frappe.qb.from_(docfield).select(Max(docfield.idx)).where(docfield.parent == self.name).run()
+		)
 		return (max_idx and max_idx[0][0]) or 0
 
 	def validate_name(self, name=None):

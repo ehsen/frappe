@@ -184,10 +184,18 @@ def clear_log_table(doctype, days=90):
 					WHERE `{original}`.`creation` > NOW() - INTERVAL '{days}' DAY"""
 			)
 			frappe.db.sql_ddl(f"RENAME TABLE `{original}` TO `{backup}`, `{temporary}` TO `{original}`")
+		elif frappe.db.db_type == "surrealdb":
+			# no CREATE LIKE / INSERT SELECT / RENAME on SurrealDB: a range DELETE on the
+			# (indexed) creation column leaves the identical net table state (P1.9b)
+			from frappe.utils import add_to_date, now_datetime
+
+			frappe.db.delete(doctype, {"creation": ("<", add_to_date(now_datetime(), days=-days))})
 	except Exception:
 		frappe.db.rollback()
-		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{temporary}`")
+		if frappe.db.db_type != "surrealdb":
+			frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{temporary}`")
 		raise
 	else:
-		frappe.db.sql_ddl(f"DROP TABLE `{backup}`")
+		if frappe.db.db_type != "surrealdb":
+			frappe.db.sql_ddl(f"DROP TABLE `{backup}`")
 		frappe.db.commit()
