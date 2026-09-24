@@ -44,6 +44,13 @@ def rewrite(query, db=None, schema_loader=None) -> tuple[str, dict | None] | Non
 			return f"REMOVE TABLE IF EXISTS {quote_table(unquote(m[1]))}", None
 		except Exception:
 			return None
+	# Only SELECT statements are rewritten. Every other statement (DELETE / INSERT /
+	# UPDATE / SET / START TRANSACTION / ...) passes through verbatim -- the server
+	# executes (or rejects) it exactly as it did before P1.6e. Without this gate a
+	# `DELETE FROM ...` had its first word parsed as a projection column and wrongly
+	# raised 1054 ("Unknown column 'DELETE' in 'field list'") instead of executing.
+	if not re.match(r"(?is)^\s*select\b", query):
+		return None
 	try:
 		return _rewrite_select(query.strip(), db, schema_loader)
 	except SurrealDBProgrammingError:

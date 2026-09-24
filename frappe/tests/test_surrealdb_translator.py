@@ -1178,3 +1178,17 @@ class TestLegacySql(UnitTestCase):
 
 	def test_unknown_table_passes_through_for_the_server_1146(self):
 		self.assertIsNone(legacy_sql.rewrite("select `tabNope`.`name` from `tabNope`", None, loader))
+
+	def test_non_select_statements_pass_through_untouched(self):
+		"""P1.6f: only SELECTs are rewritten -- DELETE/INSERT/UPDATE reach the server verbatim
+		(a `DELETE FROM` had its first word parsed as a projection column and wrongly raised
+		1054 "Unknown column 'DELETE' in 'field list'" on g1-full6)."""
+		for query in (
+			"DELETE FROM `tabUser Invitation`",
+			"delete from `tabNote` where `tabNote`.`owner` = 'x'",
+			"INSERT INTO `tabNote` (`name`) VALUES ('n1')",
+			"UPDATE `tabNote` SET `title` = 'x' WHERE `title` = 'y'",
+			"START TRANSACTION",
+			"COMMIT",
+		):
+			self.assertIsNone(legacy_sql.rewrite(query, None, loader), query)
