@@ -308,6 +308,13 @@ def _get_communications(doctype, name, start=0, limit=20):
 	return communications
 
 
+def _sql_string_literal(value: str) -> str:
+	"""Escape a string as a MariaDB single-quoted literal for the SurrealDB branch of
+	`get_communication_data`. The legacy rewriter (P1.6e) parses the literal and re-binds
+	it as a server-side parameter - the value never reaches the server as raw text."""
+	return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
+
+
 def get_communication_data(
 	doctype, name, start=0, limit=20, after=None, fields=None, group_by=None, as_dict=True
 ):
@@ -381,6 +388,44 @@ def get_communication_data(
 		LIMIT %(limit)s
 		OFFSET %(start)s
 		"""
+
+	if frappe.db.db_type == "surrealdb":
+		# SurrealDB's SQL layer has no UNION / WITH / joins (measured), so the legacy
+		# statement below fails closed with a 1064 there - and with it every getdoc()
+		# flow (get_docinfo -> timeline). Run the same two sources as one flat
+		# statement: part2's join is pre-fetched as a bound name list (typed query)
+		# and both sources' predicates are OR-collapsed. Values are interpolated as
+		# escaped literals and re-bound by the legacy rewriter (P1.6e) - nothing
+		# user-controlled reaches the server unbound, and any construct the rewriter
+		# cannot parse passes through verbatim (same 1064 as before, fail-closed).
+		# The per-part cte_limit truncation is dropped; the only possible delta is
+		# tail order inside a part truncated at cte_limit rows (part2 sorts by the
+		# link's date, not the projected communication_date).
+		linked_names = sorted(
+			{
+				r[0]
+				for r in frappe.get_all(
+					"Communication Link",
+					filters={"link_doctype": doctype, "link_name": str(name)},
+					fields=["parent"],
+					as_list=True,
+				)
+			}
+		)
+		or_links = ""
+		if linked_names:
+			or_links = " OR name IN (" + ", ".join(_sql_string_literal(n) for n in linked_names) + ")"
+		surrealdb_query = f"""
+			SELECT {fields.replace('C.', '')}
+			FROM `tabCommunication`
+			WHERE communication_type IN ('Communication', 'Automated Message')
+			AND ( (reference_doctype = {_sql_string_literal(doctype)} AND reference_name = {_sql_string_literal(str(name))}){or_links} )
+			{conditions.replace('C.', '')}
+			{group_by or ''}
+			ORDER BY communication_date DESC
+			LIMIT {frappe.utils.cint(limit)} OFFSET {frappe.utils.cint(start)}
+		"""
+		return frappe.db.sql(surrealdb_query, as_dict=as_dict)
 
 	return frappe.db.multisql(
 		{

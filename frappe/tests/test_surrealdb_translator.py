@@ -83,6 +83,15 @@ def make_schema(table="tabDoc"):
 			text_sh,
 			col("Long Text", "notes"),
 		]
+	elif table == "tabCommunication":
+		specs = [
+			S.ColumnSpec("name", "varchar(140)", nullable=False),
+			S.ColumnSpec("creation", "datetime(6)"),
+			col("Data", "communication_type"),
+			col("Date", "communication_date"),
+			col("Data", "reference_doctype"),
+			col("Data", "reference_name"),
+		]
 	else:
 		specs = [
 			S.ColumnSpec("name", "varchar(140)", nullable=False),
@@ -102,7 +111,7 @@ def make_schema(table="tabDoc"):
 
 
 def loader(name):
-	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field", "tabReport", "tabNote", "tabNote Seen By", "tabParityKid"):
+	if name not in ("tabDoc", "tabOther", "tabDocType", "tabCustom Field", "tabReport", "tabNote", "tabNote Seen By", "tabParityKid", "tabCommunication"):
 		raise SurrealDBProgrammingError(1146, f"Table '{name}' doesn't exist")
 	return make_schema(name)
 
@@ -1192,3 +1201,29 @@ class TestLegacySql(UnitTestCase):
 			"COMMIT",
 		):
 			self.assertIsNone(legacy_sql.rewrite(query, None, loader), query)
+
+	def test_desk_communication_or_collapse_branch_compiles(self):
+		"""P1.6g: the SurrealDB branch of get_communication_data (desk/form/load.py) OR-collapses
+		the UNION/JOIN timeline statement into one flat SELECT with escaped-literal values; the
+		rewriter must fully compile it (ci shadows + binds, LIMIT/START, no UNION)."""
+		query = """
+			SELECT name, communication_type, communication_date, creation AS creation
+			FROM `tabCommunication`
+			WHERE communication_type IN ('Communication', 'Automated Message')
+			AND ( (reference_doctype = 'Event' AND reference_name = 'EV00019')
+				OR name IN ('C00001', 'C00002') )
+			AND NOT (reference_doctype='User' AND communication_type='Communication')
+			ORDER BY communication_date DESC
+			LIMIT 21 OFFSET 0
+		"""
+		sql, params = self.lr(query)
+		self.assertNotIn("UNION", sql)
+		self.assertIn("(`communication_type@ci` IN [$param1, $param2])", sql)
+		self.assertIn("(`reference_doctype@ci` = $param3) AND (`reference_name@ci` = $param4)", sql)
+		self.assertIn("(`name@ci` IN [$param5, $param6])", sql)
+		self.assertIn("ORDER BY `communication_date` DESC", sql)
+		self.assertIn("LIMIT 21 START 0", sql)
+		self.assertEqual(params["param5"], C.ci_key("C00001"))
+		self.assertEqual(params["param6"], C.ci_key("C00002"))
+		self.assertEqual(params["param7"], C.ci_key("User"))
+		self.assertEqual(params["param8"], C.ci_key("Communication"))
